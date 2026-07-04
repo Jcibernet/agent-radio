@@ -352,3 +352,120 @@ fn wait_times_out_with_exit_1() {
     ]);
     assert!(!out.status.success());
 }
+
+// ---------------------------------------------------- contract gap tests --
+
+/// Defends the core claim: append-only JSONL + flock keeps concurrent
+/// writers safe. Every parallel send must land as one intact line.
+#[test]
+fn concurrent_sends_never_corrupt_the_store() {
+    let r = Radio::new();
+    let n = 12;
+    let children: Vec<_> = (0..n)
+        .map(|i| {
+            let mut c = r.cmd();
+            c.args([
+                "send",
+                "--from",
+                "a",
+                "--to",
+                "b",
+                "--branch",
+                "",
+                "--body",
+                &format!("parallel message {i}"),
+            ]);
+            c.stdout(Stdio::null()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent send failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let msgs = r.messages();
+    assert_eq!(msgs.len(), n, "every send must land as exactly one line");
+    let mut bodies: Vec<String> = msgs
+        .iter()
+        .map(|m| m["body"].as_str().unwrap().to_string())
+        .collect();
+    bodies.sort();
+    let mut expected: Vec<String> = (0..n).map(|i| format!("parallel message {i}")).collect();
+    expected.sort();
+    assert_eq!(bodies, expected);
+}
+
+/// The store format is the compatibility contract: a messages.jsonl written
+/// verbatim by the original Python implementation (space-separated JSON,
+/// sorted keys) must read and reply identically.
+#[test]
+fn reads_stores_written_by_the_python_implementation() {
+    let r = Radio::new();
+    let fixture = concat!(
+        "{\"body\": \"hola desde python\", \"from\": \"py\", \"id\": \"963ec95d78f54ceb\", ",
+        "\"kind\": \"ASK\", \"to\": \"rs\", \"ts\": \"2026-07-04T20:46:20.443053Z\", \"version\": 1}\n",
+        "{\"body\": \"full fields\", \"branch\": \"dev\", \"focus\": [\"src/a.rs\", \"src/b.rs\"], ",
+        "\"from\": \"py\", \"id\": \"aaaabbbbccccdddd\", \"kind\": \"FYI\", \"priority\": \"high\", ",
+        "\"reply_to\": \"963ec95d78f54ceb\", \"risk\": \"none\", \"thread_id\": \"963ec95d78f54ceb\", ",
+        "\"to\": \"rs\", \"ts\": \"2026-07-04T20:46:21.000000Z\", \"version\": 1}\n",
+    );
+    std::fs::write(r.dir.path().join("messages.jsonl"), fixture).unwrap();
+
+    let inbox = r.ok(&["inbox", "--as", "rs"]);
+    assert!(inbox.contains("hola desde python"));
+    assert!(inbox.contains("full fields"));
+    assert!(inbox.contains("focus: src/a.rs, src/b.rs"));
+    let history = r.ok(&["history"]);
+    assert!(history.contains("963ec95d78f54ceb"));
+
+    r.ok(&["done", "1", "--as", "rs", "--body", "leido"]);
+    let reply = r.messages().pop().unwrap();
+    assert_eq!(reply["to"], "py");
+    assert_eq!(reply["reply_to"], "963ec95d78f54ceb");
+    assert_eq!(
+        reply["branch"].as_str(),
+        None,
+        "fixture msg #1 has no branch"
+    );
+}
+
+/// Replies must thread to the ROOT message id, not the intermediate reply.
+#[test]
+fn thread_id_survives_reply_chains() {
+    let r = Radio::new();
+    r.ok(&[
+        "send", "--from", "a", "--to", "b", "--kind", "ASK", "--body", "root ask", "--branch", "",
+    ]);
+    let root_id = r.messages()[0]["id"].as_str().unwrap().to_string();
+    r.ok(&["inbox", "--as", "b"]);
+    r.ok(&["done", "1", "--as", "b", "--body", "reply one"]);
+    let done_id = r.messages()[1]["id"].as_str().unwrap().to_string();
+
+    r.ok(&["inbox", "--as", "a"]);
+    r.ok(&["ack", "1", "--as", "a", "--body", "thanks"]);
+    let ack = r.messages().pop().unwrap();
+    assert_eq!(ack["reply_to"], done_id.as_str());
+    assert_eq!(
+        ack["thread_id"],
+        root_id.as_str(),
+        "thread must point at the root, not the intermediate reply"
+    );
+}
+
+/// Replying to a message you sent must target the recipient, not yourself.
+#[test]
+fn replying_to_own_message_targets_recipient() {
+    let r = Radio::new();
+    r.ok(&[
+        "send", "--from", "a", "--to", "b", "--kind", "ASK", "--body", "mine", "--branch", "",
+    ]);
+    r.ok(&["history", "--as", "a"]);
+    r.ok(&["ack", "1", "--as", "a", "--body", "self follow-up"]);
+    let reply = r.messages().pop().unwrap();
+    assert_eq!(reply["to"], "b");
+    assert_eq!(reply["from"], "a");
+}
