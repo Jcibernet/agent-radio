@@ -137,9 +137,13 @@ struct LockGuard(fs::File);
 
 fn locked(s: &Store) -> LockGuard {
     fs::create_dir_all(&s.root).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    // read+write (not append-only): Windows' LockFileEx rejects handles
+    // without real read/write access — the Python impl's "a+" for the
+    // same reason. Never truncated, never written; it exists to be locked.
     let file = fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .read(true)
+        .write(true)
         .open(&s.lock)
         .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
     file.lock()
