@@ -31,10 +31,9 @@ class RadioTestCase(unittest.TestCase):
 
     def run_cli(self, *argv: str) -> str:
         out = io.StringIO()
+        args = agent_radio.build_parser().parse_args(argv)
         with contextlib.redirect_stdout(out):
-            agent_radio.build_parser().parse_args(argv).func(
-                agent_radio.build_parser().parse_args(argv)
-            )
+            args.func(args)
         return out.getvalue()
 
     def messages(self) -> list[dict]:
@@ -106,6 +105,57 @@ class FlowTests(RadioTestCase):
         self.run_cli("send", "--from", "a", "--to", "b", "--body", "x", "--branch", "")
         status = json.loads(self.run_cli("status", "--as", "b"))
         self.assertEqual(status["unread"], 1)
+
+
+class SanitizeTests(unittest.TestCase):
+    """Mirrors h5i's sanitize_display contract (terminal-injection guard)."""
+
+    def test_neutralises_csi_and_osc_sequences(self) -> None:
+        self.assertEqual(agent_radio.sanitize("before\x1b[2Jafter"), "before[2Jafter")
+        self.assertEqual(
+            agent_radio.sanitize("term\x1b]0;owned title\x07message"),
+            "term]0;owned titlemessage",
+        )
+
+    def test_neutralises_overwrite_and_control_chars(self) -> None:
+        self.assertEqual(agent_radio.sanitize("safe line\rforged line"), "safe line forged line")
+        self.assertEqual(agent_radio.sanitize("abc\x08\x08X"), "abcX")
+        cleaned = agent_radio.sanitize("a\x00b\x7fc\u009b31md\u0085e")
+        self.assertEqual(cleaned, "abc31mde")
+        self.assertFalse(any(ch for ch in cleaned if ch != " " and not ch.isprintable()))
+
+    def test_rendered_output_never_contains_controls(self) -> None:
+        lines = agent_radio.render([{
+            "id": "x", "ts": "t", "from": "a", "to": "b", "kind": "FYI",
+            "body": "evil\x1b[2J\x07body", "risk": "r\x1bisk",
+            "focus": ["f\x07ile.py"],
+        }])
+        joined = "\n".join(lines)
+        self.assertFalse(any(ord(ch) < 32 and ch != "\n" for ch in joined))
+
+
+class StdinBodyTests(RadioTestCase):
+    def test_send_body_dash_reads_stdin(self) -> None:
+        from unittest import mock
+
+        stdin = io.StringIO("multi 'quoted' body\nfrom stdin")
+        with mock.patch("sys.stdin", stdin):
+            self.run_cli(
+                "send", "--from", "a", "--to", "b", "--body", "-", "--branch", "",
+            )
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["body"], "multi 'quoted' body\nfrom stdin")
+
+    def test_reply_body_dash_reads_stdin(self) -> None:
+        from unittest import mock
+
+        self.run_cli("send", "--from", "a", "--to", "b", "--kind", "ASK",
+                     "--body", "q", "--branch", "")
+        self.run_cli("inbox", "--as", "b")
+        with mock.patch("sys.stdin", io.StringIO("done via stdin")):
+            self.run_cli("done", "1", "--as", "b", "--body", "-")
+        self.assertEqual(self.messages()[1]["body"], "done via stdin")
 
 
 class GuardTests(RadioTestCase):

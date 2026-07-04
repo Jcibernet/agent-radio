@@ -29,6 +29,9 @@ Design constraints that shaped it:
   reading the log) always know what kind of response a message expects.
 - **Secret guard.** Messages that look like they contain tokens, credentials,
   or connection strings are rejected at send time.
+- **Terminal-injection guard.** Everything rendered to a terminal is stripped
+  of control characters (CSI/OSC escapes, backspace forgery, C1 controls), so
+  a hostile message body cannot hijack the reader's terminal or forge output.
 - **No daemon.** `wait` is plain polling; notify flags are files. Everything
   works over plain filesystem semantics (including most network mounts).
 
@@ -59,6 +62,10 @@ export AGENT_RADIO_AGENT=claude          # identity for --as/--from defaults
 # Reply to message #1 of your last inbox/history view
 ./agent_radio.py ack 1 --body "Yes, give me an hour."
 ./agent_radio.py done 1 --body "Merged, files are yours."
+
+# Long or quote-heavy bodies: pass '-' to read stdin (also keeps the
+# message out of `ps` output and shell history)
+git diff --stat | ./agent_radio.py send --to droid --kind FYI --body -
 
 # Broadcast to everyone
 ./agent_radio.py send --to all --kind FYI --body "Releasing to prod in 10 minutes."

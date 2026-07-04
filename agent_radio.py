@@ -277,9 +277,18 @@ def unread_for(s: Store, agent: str) -> list[dict[str, Any]]:
     return [m for m in load_messages(s) if addressed_to(m, agent) and m.get("id") not in seen]
 
 
+# Terminal-injection guard: rendered messages must never carry control
+# characters (CSI/OSC escapes, backspace forgery, C1 controls) into the
+# reader's terminal. \t/\r/\n become spaces; everything else control-ish
+# is dropped.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]")
+
+
 def sanitize(text: Any) -> str:
     s = str(text or "")
-    return " ".join(s.replace("\t", " ").replace("\r", " ").replace("\n", " ").split())
+    s = s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    s = _CONTROL_RE.sub("", s)
+    return " ".join(s.split())
 
 
 def short(text: Any, limit: int = 140) -> str:
@@ -288,19 +297,22 @@ def short(text: Any, limit: int = 140) -> str:
 
 
 def render(messages: Iterable[dict[str, Any]]) -> list[str]:
+    # render() is the trust boundary: any process can append to the JSONL,
+    # so every displayed field goes through sanitize(), not just the body.
     lines: list[str] = []
     for idx, msg in enumerate(messages, start=1):
-        branch = f" · {msg.get('branch')}" if msg.get("branch") else ""
-        reply = f" · re {msg.get('reply_to')}" if msg.get("reply_to") else ""
-        priority = f" · {msg.get('priority')}" if msg.get("priority") else ""
+        branch = f" · {sanitize(msg.get('branch'))}" if msg.get("branch") else ""
+        reply = f" · re {sanitize(msg.get('reply_to'))}" if msg.get("reply_to") else ""
+        priority = f" · {sanitize(msg.get('priority'))}" if msg.get("priority") else ""
         lines.append(
-            f"{idx:>2}. {msg.get('ts')} {msg.get('from')} -> {msg.get('to')} "
-            f"{msg.get('kind')}{priority}{branch}{reply} #{msg.get('id')}"
+            f"{idx:>2}. {sanitize(msg.get('ts'))} {sanitize(msg.get('from'))} "
+            f"-> {sanitize(msg.get('to'))} "
+            f"{sanitize(msg.get('kind'))}{priority}{branch}{reply} #{sanitize(msg.get('id'))}"
         )
         focus = msg.get("focus") or []
         risk = msg.get("risk")
         if focus:
-            lines.append(f"    focus: {', '.join(map(str, focus))}")
+            lines.append(f"    focus: {', '.join(sanitize(f) for f in focus)}")
         if risk:
             lines.append(f"    risk : {short(risk, 180)}")
         lines.append(f"    {short(msg.get('body'), 260)}")
@@ -367,6 +379,13 @@ def make_message(
     return msg
 
 
+def body_arg(raw: str) -> str:
+    """``-`` reads the body from stdin: no shell quoting, nothing in argv/ps."""
+    if raw == "-":
+        return sys.stdin.read()
+    return raw
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     s = store()
     sender = agent_from_env(args.sender)
@@ -375,7 +394,7 @@ def cmd_send(args: argparse.Namespace) -> None:
         sender=sender,
         to=validate_name(args.to),
         kind=args.kind,
-        body=args.body,
+        body=body_arg(args.body),
         branch=branch,
         focus=args.focus,
         risk=args.risk,
@@ -434,7 +453,7 @@ def cmd_reply_kind(args: argparse.Namespace, kind: str) -> None:
     me = agent_from_env(args.as_agent)
     with locked(s):
         original = find_by_view_number(s, me, args.number)
-        body = args.body.strip() or kind.lower()
+        body = body_arg(args.body).strip() or kind.lower()
         msg = make_message(
             sender=me,
             to=validate_name(reply_target(original, me)),
@@ -503,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--from", dest="sender")
     send.add_argument("--to", required=True)
     send.add_argument("--kind", default="ASK")
-    send.add_argument("--body", required=True)
+    send.add_argument("--body", required=True, help="message text; '-' reads stdin")
     send.add_argument("--branch", help="default: current git branch; pass '' to omit")
     send.add_argument("--focus", action="append", default=[])
     send.add_argument("--risk")
@@ -526,7 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=f"reply to a numbered message with {kind}")
         p.add_argument("number", type=int)
         p.add_argument("--as", dest="as_agent")
-        p.add_argument("--body", default="")
+        p.add_argument("--body", default="", help="reply text; '-' reads stdin")
         p.set_defaults(func=lambda args, k=kind: cmd_reply_kind(args, k))
 
     team = sub.add_parser("team", help="list known agents")
