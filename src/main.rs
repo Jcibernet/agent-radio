@@ -142,6 +142,7 @@ fn locked(s: &Store) -> LockGuard {
     // same reason. Never truncated, never written; it exists to be locked.
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&s.lock)
