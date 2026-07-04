@@ -1,13 +1,13 @@
 /**
  * agent-radio as a native omp (https://omp.sh) custom tool.
  *
- * Thin, schema'd wrapper over `agent_radio.py` (the single source of truth:
- * file locking, secret scanning, notify flags all live there). This exists to
- * kill the bash-quoting tax on radio bodies (quotes, accents, long strings)
- * and give the model structured params.
+ * Thin, schema'd wrapper over the `agent-radio` binary (the single source of
+ * truth: file locking, secret scanning, notify flags all live there). This
+ * exists to kill the bash-quoting tax on radio bodies (quotes, accents, long
+ * strings) and give the model structured params.
  *
- * Install: copy into `.omp/tools/` in your repo. If the script is not at
- * `./agent_radio.py`, set AGENT_RADIO_SCRIPT to its path.
+ * Install: copy into `.omp/tools/` in your repo. If the binary is not on
+ * PATH, set AGENT_RADIO_BIN to its location.
  */
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
 
@@ -32,7 +32,7 @@ const factory: CustomToolFactory = (pi) => {
 		name: "radio",
 		label: "Agent Radio",
 		description: [
-			"Local agent radio (agent_radio.py) for coordinating with the other agents",
+			"Local agent radio (agent-radio binary) for coordinating with the other agents",
 			"working this worktree (opencode, droid, ...). Ops:",
 			"send (requires to+body; kind defaults ASK),",
 			"inbox (unread for me; peek=true to not mark read),",
@@ -92,9 +92,7 @@ const factory: CustomToolFactory = (pi) => {
 
 		async execute(_toolCallId, params, _onUpdate, _ctx, signal) {
 			const me = params.as ?? process.env.AGENT_RADIO_AGENT ?? "claude";
-			const argv: string[] = [
-				process.env.AGENT_RADIO_SCRIPT ?? "agent_radio.py",
-			];
+			const argv: string[] = [];
 
 			switch (params.op) {
 				case "send": {
@@ -150,7 +148,8 @@ const factory: CustomToolFactory = (pi) => {
 				}
 			}
 
-			const result = await pi.exec("python3", argv, {
+			const bin = process.env.AGENT_RADIO_BIN ?? "agent-radio";
+			const result = await pi.exec(bin, argv, {
 				cwd: pi.cwd,
 				signal,
 			});

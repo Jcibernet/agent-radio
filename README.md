@@ -2,7 +2,7 @@
 
 A tiny, file-backed message bus for coordinating multiple local coding agents
 (Claude Code, opencode, Codex, Droid, ...) that share the same machine or git
-worktree. No server, no MCP, no hooks — one Python file, zero dependencies.
+worktree. No server, no MCP, no hooks — a single static binary.
 
 ```
 opencode ──┐
@@ -34,17 +34,20 @@ Design constraints that shaped it:
   a hostile message body cannot hijack the reader's terminal or forge output.
 - **No daemon.** `wait` is plain polling; notify flags are files. Everything
   works over plain filesystem semantics (including most network mounts).
+- **The store is the contract.** Any implementation that preserves the JSONL
+  format and sidecars interoperates; the conformance suite in `tests/` is the
+  spec. (The project started as a single Python file — this Rust binary reads
+  and writes the exact same store.)
 
 ## Install
 
-It is one file. Copy it, or:
+Prebuilt binaries for Linux, macOS, and Windows are on the
+[releases page](https://github.com/Jcibernet/agent-radio/releases), or build
+from source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jcibernet/agent-radio/main/agent_radio.py -o agent_radio.py
-chmod +x agent_radio.py
+cargo install --git https://github.com/Jcibernet/agent-radio
 ```
-
-Requires Python 3.10+ and a POSIX system (`fcntl`).
 
 ## Usage
 
@@ -52,32 +55,32 @@ Requires Python 3.10+ and a POSIX system (`fcntl`).
 export AGENT_RADIO_AGENT=claude          # identity for --as/--from defaults
 
 # Ask another agent something, pointing at concrete files
-./agent_radio.py send --to opencode --kind ASK \
+agent-radio send --to opencode --kind ASK \
   --body "Are you still touching parse_pipeline.py? I need to extend the extractor." \
   --focus backend/app/services/parse_pipeline.py
 
 # Read your inbox (marks read; --peek to just look)
-./agent_radio.py inbox
+agent-radio inbox
 
 # Reply to message #1 of your last inbox/history view
-./agent_radio.py ack 1 --body "Yes, give me an hour."
-./agent_radio.py done 1 --body "Merged, files are yours."
+agent-radio ack 1 --body "Yes, give me an hour."
+agent-radio done 1 --body "Merged, files are yours."
 
 # Long or quote-heavy bodies: pass '-' to read stdin (also keeps the
 # message out of `ps` output and shell history)
-git diff --stat | ./agent_radio.py send --to droid --kind FYI --body -
+git diff --stat | agent-radio send --to droid --kind FYI --body -
 
 # Broadcast to everyone
-./agent_radio.py send --to all --kind FYI --body "Releasing to prod in 10 minutes."
+agent-radio send --to all --kind FYI --body "Releasing to prod in 10 minutes."
 
 # Recent traffic, filtered
-./agent_radio.py history --limit 30 --with droid
+agent-radio history --limit 30 --with droid
 
 # Who's on the air / do I have mail / block until something arrives
-./agent_radio.py team
-./agent_radio.py status            # {"agent": ..., "unread": N, "flag": bool}
-./agent_radio.py status --quiet    # exit 0 iff unread > 0 (for shell loops)
-./agent_radio.py wait --timeout 300
+agent-radio team
+agent-radio status            # {"agent": ..., "unread": N, "flag": bool}
+agent-radio status --quiet    # exit 0 iff unread > 0 (for shell loops)
+agent-radio wait --timeout 300
 ```
 
 ### Message kinds
@@ -128,8 +131,8 @@ One JSON object per line in `messages.jsonl`:
 
 - **[omp](https://omp.sh) custom tool** — `integrations/omp/radio.ts` exposes
   the radio as a schema'd native tool (no shell quoting for message bodies).
-  Drop it in `.omp/tools/` in your repo; point `AGENT_RADIO_SCRIPT` at the
-  script if it is not at `./agent_radio.py`.
+  Drop it in `.omp/tools/` in your repo; set `AGENT_RADIO_BIN` if the binary
+  is not on PATH.
 - **Any other harness** — it is a CLI; call it from bash. The `--quiet` status
   and `wait` subcommands are designed for scripting.
 
@@ -145,8 +148,11 @@ One JSON object per line in `messages.jsonl`:
 ## Testing
 
 ```bash
-python3 -m unittest test_agent_radio -v
+cargo test
 ```
+
+`tests/conformance.rs` doubles as the protocol spec: it exercises the store
+format, CLI contract, sanitization, and guards against the built binary.
 
 ## License
 
