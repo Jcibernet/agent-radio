@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -213,6 +213,92 @@ fn gen_id(ts: &str, sender: &str, to: &str, body: &str) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<String>()[..16]
         .to_string()
+}
+
+fn sha256_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    Some(sha256_bytes(&data))
+}
+
+/// Compute manifest digest per contract: lines "<path>:<hash>" or "<path>:(deleted)" sorted by path.
+fn compute_manifest_digest(files: &BTreeMap<String, Option<String>>) -> String {
+    let mut lines = Vec::new();
+    for (path, hash) in files {
+        let line = match hash {
+            Some(h) => format!("{path}:{h}"),
+            None => format!("{path}:(deleted)"),
+        };
+        lines.push(line);
+    }
+    let input = lines.join("\n");
+    sha256_bytes(input.as_bytes())
+}
+
+/// Returns file paths (relative to git root) from `git status --porcelain -uall`.
+/// For renames ("R N old -> new"), takes the new path after the LAST " -> ".
+fn git_status_files() -> Vec<String> {
+    let out = Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .output()
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut files = Vec::new();
+    for line in stdout.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = &line[3..];
+        if let Some(pos) = rest.rfind(" -> ") {
+            files.push(rest[pos + 4..].to_string());
+        } else {
+            files.push(rest.to_string());
+        }
+    }
+    files
+}
+
+/// Hash paths relative to cwd, store as relative to git root.
+/// Returns Map suitable for inserting as "manifest" in a message.
+fn make_manifest(paths: &[String]) -> Map<String, Value> {
+    let git_root = git_root();
+    let mut files: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for path_str in paths {
+        let p = Path::new(path_str);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        let rel = abs
+            .strip_prefix(&git_root)
+            .unwrap_or_else(|_| {
+                die(&format!(
+                    "agent-radio: path {path_str} is outside git worktree"
+                ))
+            })
+            .to_string_lossy()
+            .to_string();
+        let hash = sha256_file(&abs);
+        files.insert(rel, hash);
+    }
+    let digest = compute_manifest_digest(&files);
+    let mut m = Map::new();
+    m.insert("files".into(), json!(files));
+    m.insert("digest".into(), json!(digest));
+    m
 }
 
 fn load_messages(s: &Store) -> Vec<Map<String, Value>> {
@@ -441,6 +527,22 @@ fn render(messages: &[Map<String, Value>]) -> Vec<String> {
             lines.push(format!("    risk : {}", short(risk, 180)));
         }
         lines.push(format!("    {}", short(str_field(msg, "body"), 260)));
+        if msg.contains_key("manifest") {
+            if let Some(m) = msg["manifest"].as_object() {
+                let n_files = m
+                    .get("files")
+                    .and_then(Value::as_object)
+                    .map(|o| o.len())
+                    .unwrap_or(0);
+                let digest = m.get("digest").and_then(Value::as_str).unwrap_or("");
+                let short_digest = if digest.len() > 8 {
+                    &digest[..8]
+                } else {
+                    digest
+                };
+                lines.push(format!("    [manifest {n_files} files @{short_digest}]"));
+            }
+        }
     }
     lines
 }
@@ -565,6 +667,16 @@ fn cmd_send(args: &SendArgs) {
         None,
         None,
     );
+    let mut msg = msg;
+    if !args.manifest.is_empty() {
+        let m = make_manifest(&args.manifest);
+        msg.insert("manifest".into(), json!(m));
+    }
+    if let Some(t) = &args.task {
+        if !t.is_empty() {
+            msg.insert("task".into(), json!(t));
+        }
+    }
     {
         let _guard = locked(&s);
         let mut messages = load_messages(&s);
@@ -639,10 +751,304 @@ fn cmd_history(
     }
 }
 
-fn cmd_reply_kind(kind: &str, number: usize, as_agent: Option<&str>, body: &str) {
+fn cmd_manifest_emit(task: Option<String>, paths: Vec<String>) {
+    let paths = if paths.is_empty() {
+        let p = git_status_files();
+        if p.is_empty() {
+            die("agent-radio: nothing to hash");
+        }
+        p
+    } else {
+        paths
+    };
+    let git_root = git_root();
+    let mut files: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for path_str in &paths {
+        let p = Path::new(path_str);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        let rel = abs
+            .strip_prefix(&git_root)
+            .unwrap_or_else(|_| {
+                die(&format!(
+                    "agent-radio: path {path_str} is outside git worktree"
+                ))
+            })
+            .to_string_lossy()
+            .to_string();
+        let hash = sha256_file(&abs);
+        files.insert(rel, hash);
+    }
+    let digest = compute_manifest_digest(&files);
+    let mut result = Map::new();
+    result.insert("generated_at".into(), json!(utc_now()));
+    if let Some(t) = task.filter(|t| !t.is_empty()) {
+        result.insert("task".into(), json!(t));
+    }
+    result.insert("files".into(), json!(files));
+    result.insert("digest".into(), json!(digest));
+    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+}
+
+fn cmd_manifest_verify(
+    number: Option<usize>,
+    task: Option<String>,
+    strict: bool,
+    as_agent: Option<String>,
+) {
+    let s = store();
+    let msg;
+    if let Some(n) = number {
+        let agent = agent_from_env(as_agent.as_deref());
+        let _guard = locked(&s);
+        msg = find_by_view_number(&s, &agent, n);
+    } else if let Some(t) = task {
+        let msgs = load_messages(&s);
+        msg = msgs
+            .into_iter()
+            .rev()
+            .find(|m| str_field(m, "task") == t.as_str() && m.contains_key("manifest"))
+            .unwrap_or_else(|| die(&format!("agent-radio: no manifest found for task '{t}'")));
+    } else {
+        die("agent-radio: specify a NUMBER or --task <id>");
+    };
+
+    let manifest = msg
+        .get("manifest")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| die("agent-radio: message has no manifest"));
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| die("agent-radio: manifest has no files"));
+    let reported_digest = manifest
+        .get("digest")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let task_label = {
+        let t = str_field(&msg, "task");
+        if t.is_empty() {
+            str_field(&msg, "from").to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
+    let git_root = git_root();
+    let mut has_errors = false;
+    let mut has_orphans = false;
+    let mut all_claimed = BTreeSet::new();
+    let mut recomputed_files: BTreeMap<String, Option<String>> = BTreeMap::new();
+
+    let mut sorted_paths: Vec<&String> = files.keys().collect();
+    sorted_paths.sort();
+
+    for path_str in sorted_paths {
+        let hash_val = files.get(path_str).unwrap();
+        let abs_path = git_root.join(path_str);
+        all_claimed.insert(path_str.clone());
+
+        let exists = abs_path.exists();
+        let reported = hash_val.as_str();
+
+        match (exists, reported) {
+            (true, Some(rep)) => {
+                let computed = sha256_file(&abs_path).unwrap_or_default();
+                if computed == rep {
+                    println!("OK {path_str}");
+                    recomputed_files.insert(path_str.clone(), Some(computed));
+                } else {
+                    println!(
+                        "MISMATCH {path_str} (reportado {}… != disco {}…)",
+                        &rep[..12.min(rep.len())],
+                        &computed[..12.min(computed.len())]
+                    );
+                    has_errors = true;
+                    recomputed_files.insert(path_str.clone(), Some(computed));
+                }
+            }
+            (true, None) => {
+                println!("MISMATCH {path_str} (reportado (deleted) != disco present)");
+                has_errors = true;
+                let computed = sha256_file(&abs_path);
+                recomputed_files.insert(path_str.clone(), computed);
+            }
+            (false, Some(_rep)) => {
+                println!("MISSING {path_str}");
+                has_errors = true;
+                recomputed_files.insert(path_str.clone(), None);
+            }
+            (false, None) => {
+                println!("OK {path_str}");
+                recomputed_files.insert(path_str.clone(), None);
+            }
+        }
+    }
+
+    let computed_digest = compute_manifest_digest(&recomputed_files);
+    if computed_digest != reported_digest {
+        eprintln!(
+            "agent-radio: digest mismatch (reportado {}… != computado {}…)",
+            &reported_digest[..12.min(reported_digest.len())],
+            &computed_digest[..12.min(computed_digest.len())]
+        );
+        has_errors = true;
+    }
+
+    if strict {
+        let dirty = git_status_files();
+        for d in dirty {
+            if !all_claimed.contains(&d) {
+                eprintln!("HUERFANO {d}");
+                has_orphans = true;
+            }
+        }
+    }
+
+    let status = if has_errors {
+        "NO COINCIDE"
+    } else if has_orphans {
+        "HUERFANOS"
+    } else {
+        "VERIFICADO"
+    };
+    println!("-- tarea '{task_label}': {status}");
+
+    if has_errors {
+        exit(2);
+    }
+    if has_orphans {
+        exit(3);
+    }
+}
+
+fn cmd_manifest_map(limit: usize, strict: bool) {
+    let s = store();
+    let all_msgs = load_messages(&s);
+
+    let mut with_manifest: Vec<&Map<String, Value>> = all_msgs
+        .iter()
+        .filter(|m| m.contains_key("manifest"))
+        .collect();
+    with_manifest.reverse();
+
+    let mut seen: BTreeMap<String, &Map<String, Value>> = BTreeMap::new();
+    for msg in &with_manifest {
+        let key = {
+            let t = str_field(msg, "task");
+            if t.is_empty() {
+                let from = str_field(msg, "from");
+                let id = str_field(msg, "id");
+                let short = if id.len() > 8 { &id[..8] } else { id };
+                format!("{from}#{short}")
+            } else {
+                t.to_string()
+            }
+        };
+        seen.entry(key).or_insert(msg);
+    }
+
+    let entries: Vec<(&String, &&Map<String, Value>)> = seen.iter().take(limit).collect();
+
+    let git_root = git_root();
+    let mut all_ok = true;
+    let mut has_orphans = false;
+    let mut all_claimed: BTreeSet<String> = BTreeSet::new();
+
+    println!("TASK | FROM | KIND | TS | FILES | DIGEST | ESTADO");
+    println!("-----|------|----|---|-----|------|-------");
+
+    for (task_key, msg) in &entries {
+        let manifest = msg.get("manifest").and_then(Value::as_object).unwrap();
+        let files = manifest.get("files").and_then(Value::as_object).unwrap();
+        let n_files = files.len();
+        let digest = manifest.get("digest").and_then(Value::as_str).unwrap_or("");
+        let short_digest = if digest.len() > 8 {
+            &digest[..8]
+        } else {
+            digest
+        };
+
+        let mut ok = true;
+        let mut paths = Vec::new();
+        for (path_str, hash_val) in files {
+            let abs_path = git_root.join(path_str);
+            all_claimed.insert(path_str.to_string());
+            paths.push(path_str.to_string());
+            let exists = abs_path.exists();
+            let reported = hash_val.as_str();
+            match (exists, reported) {
+                (true, Some(rep)) => {
+                    let computed = sha256_file(&abs_path).unwrap_or_default();
+                    if computed != rep {
+                        ok = false;
+                    }
+                }
+                (true, None) | (false, Some(_)) => {
+                    ok = false;
+                }
+                (false, None) => {}
+            }
+        }
+        if !ok {
+            all_ok = false;
+        }
+        paths.sort();
+        let estado = if ok { "VERIFICADO" } else { "NO COINCIDE" };
+        let suffix = if paths.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", paths.join(","))
+        };
+
+        println!(
+            "{} | {} | {} | {} | {} | {} | {}{}",
+            task_key,
+            str_field(msg, "from"),
+            str_field(msg, "kind"),
+            sanitize(str_field(msg, "ts")),
+            n_files,
+            short_digest,
+            estado,
+            suffix,
+        );
+    }
+
+    if strict {
+        let dirty = git_status_files();
+        for d in dirty {
+            if !all_claimed.contains(&d) {
+                eprintln!("HUERFANO {d}");
+                has_orphans = true;
+            }
+        }
+    }
+
+    if has_orphans {
+        exit(3);
+    }
+    if !all_ok {
+        exit(2);
+    }
+}
+
+fn cmd_reply_kind(
+    kind: &str,
+    number: usize,
+    as_agent: Option<&str>,
+    body: &str,
+    manifest: &[String],
+) {
     let s = store();
     let me = agent_from_env(as_agent);
-    let msg;
+    let mut msg;
     let original_id;
     {
         let _guard = locked(&s);
@@ -674,6 +1080,10 @@ fn cmd_reply_kind(kind: &str, number: usize, as_agent: Option<&str>, body: &str)
             Some(&original_id),
             Some(&thread).filter(|t| !t.is_empty()).map(String::as_str),
         );
+        if !manifest.is_empty() {
+            let m = make_manifest(manifest);
+            msg.insert("manifest".into(), json!(m));
+        }
         let mut messages = load_messages(&s);
         append_message(&s, &msg);
         messages.push(msg.clone());
@@ -789,6 +1199,12 @@ struct SendArgs {
     risk: Option<String>,
     #[arg(long, value_parser = ["low", "normal", "high", "urgent"])]
     priority: Option<String>,
+    /// task identifier
+    #[arg(long)]
+    task: Option<String>,
+    /// paths to include in manifest (hashed at send time)
+    #[arg(long)]
+    manifest: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -800,6 +1216,52 @@ struct ReplyArgs {
     /// reply text; '-' reads stdin
     #[arg(long, default_value = "")]
     body: String,
+    /// paths to include in manifest (hashed at reply time)
+    #[arg(long)]
+    manifest: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct ManifestEmitArgs {
+    /// task identifier
+    #[arg(long)]
+    task: Option<String>,
+    /// paths to hash (default: files from git status)
+    paths: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct ManifestVerifyArgs {
+    /// message number from last view
+    #[arg(conflicts_with = "task")]
+    number: Option<usize>,
+    /// task id to search (most recent manifest for that task)
+    #[arg(long, conflicts_with = "number")]
+    task: Option<String>,
+    /// also check for unclaimed dirty files in worktree
+    #[arg(long)]
+    strict: bool,
+    /// agent identity (required with NUMBER)
+    #[arg(long = "as")]
+    as_agent: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ManifestMapArgs {
+    #[arg(long, default_value_t = 30)]
+    limit: usize,
+    #[arg(long)]
+    strict: bool,
+}
+
+#[derive(Subcommand)]
+enum ManifestCmd {
+    /// Hash file paths and emit manifest JSON
+    Emit(ManifestEmitArgs),
+    /// Verify a message's manifest against the worktree
+    Verify(ManifestVerifyArgs),
+    /// Show table of all manifests across messages
+    Map(ManifestMapArgs),
 }
 
 #[derive(Subcommand)]
@@ -835,6 +1297,9 @@ enum Cmd {
     Decline(ReplyArgs),
     /// reply to a numbered message with FAILURE
     Failure(ReplyArgs),
+    /// Create and verify file manifests
+    #[command(subcommand)]
+    Manifest(ManifestCmd),
     /// list known agents
     Team,
     /// show unread count and notify flag
@@ -871,10 +1336,35 @@ fn main() {
             with_agent.as_deref(),
             branch.as_deref(),
         ),
-        Cmd::Ack(a) => cmd_reply_kind("ACK", a.number, a.as_agent.as_deref(), &a.body),
-        Cmd::Done(a) => cmd_reply_kind("DONE", a.number, a.as_agent.as_deref(), &a.body),
-        Cmd::Decline(a) => cmd_reply_kind("DECLINE", a.number, a.as_agent.as_deref(), &a.body),
-        Cmd::Failure(a) => cmd_reply_kind("FAILURE", a.number, a.as_agent.as_deref(), &a.body),
+        Cmd::Ack(a) => cmd_reply_kind("ACK", a.number, a.as_agent.as_deref(), &a.body, &a.manifest),
+        Cmd::Done(a) => {
+            cmd_reply_kind(
+                "DONE",
+                a.number,
+                a.as_agent.as_deref(),
+                &a.body,
+                &a.manifest,
+            );
+        }
+        Cmd::Decline(a) => cmd_reply_kind(
+            "DECLINE",
+            a.number,
+            a.as_agent.as_deref(),
+            &a.body,
+            &a.manifest,
+        ),
+        Cmd::Failure(a) => cmd_reply_kind(
+            "FAILURE",
+            a.number,
+            a.as_agent.as_deref(),
+            &a.body,
+            &a.manifest,
+        ),
+        Cmd::Manifest(command) => match command {
+            ManifestCmd::Emit(a) => cmd_manifest_emit(a.task, a.paths),
+            ManifestCmd::Verify(a) => cmd_manifest_verify(a.number, a.task, a.strict, a.as_agent),
+            ManifestCmd::Map(a) => cmd_manifest_map(a.limit, a.strict),
+        },
         Cmd::Team => cmd_team(),
         Cmd::Status { as_agent, quiet } => cmd_status(as_agent.as_deref(), quiet),
         Cmd::Wait {

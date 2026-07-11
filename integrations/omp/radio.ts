@@ -38,6 +38,7 @@ const factory: CustomToolFactory = (pi) => {
 			"inbox (unread for me; peek=true to not mark read),",
 			"history (recent traffic; limit/with filters),",
 			"ack/done/decline/failure (reply to a numbered message from the last inbox/history view),",
+			"manifest_emit/manifest_verify/manifest_map (hash and verify task manifests),",
 			"team (known agents), status (unread count), wait (block until a message arrives).",
 			"Bodies are plain prose, no secrets (the script rejects credential-looking text).",
 		].join(" "),
@@ -47,6 +48,9 @@ const factory: CustomToolFactory = (pi) => {
 				"inbox",
 				"history",
 				...REPLY_OPS,
+				"manifest_emit",
+				"manifest_verify",
+				"manifest_map",
 				"team",
 				"status",
 				"wait",
@@ -70,11 +74,27 @@ const factory: CustomToolFactory = (pi) => {
 				.describe("send: concrete files/paths this message is about"),
 			risk: z.string().optional().describe("send: one-line risk note"),
 			priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
+			task: z
+				.string()
+				.optional()
+				.describe("send/manifest_emit/manifest_verify: task identifier"),
+			paths: z
+				.array(z.string())
+				.optional()
+				.describe("manifest_emit: paths to hash"),
+			manifest: z
+				.array(z.string())
+				.optional()
+				.describe("send/replies: paths to include in a manifest"),
+			strict: z
+				.boolean()
+				.optional()
+				.describe("manifest_verify/manifest_map: report unclaimed dirty files"),
 			number: z
 				.number()
 				.int()
 				.optional()
-				.describe("replies: message # from the last inbox/history view"),
+				.describe("replies/manifest_verify: message # from the last inbox/history view"),
 			peek: z
 				.boolean()
 				.optional()
@@ -105,6 +125,8 @@ const factory: CustomToolFactory = (pi) => {
 					for (const f of params.focus ?? []) argv.push("--focus", f);
 					if (params.risk) argv.push("--risk", params.risk);
 					if (params.priority) argv.push("--priority", params.priority);
+					if (params.task) argv.push("--task", params.task);
+					for (const m of params.manifest ?? []) argv.push("--manifest", m);
 					break;
 				}
 				case "inbox": {
@@ -129,6 +151,32 @@ const factory: CustomToolFactory = (pi) => {
 					}
 					argv.push(params.op, String(params.number), "--as", me);
 					if (params.body) argv.push("--body", params.body);
+					for (const m of params.manifest ?? []) argv.push("--manifest", m);
+					break;
+				}
+				case "manifest_emit": {
+					argv.push("manifest", "emit");
+					if (params.task) argv.push("--task", params.task);
+					for (const p of params.paths ?? []) argv.push(p);
+					break;
+				}
+				case "manifest_verify": {
+					argv.push("manifest", "verify");
+					if (params.number != null) {
+						argv.push(String(params.number));
+					} else if (params.task) {
+						argv.push("--task", params.task);
+					} else {
+						throw new Error("manifest_verify requires 'number' or 'task'");
+					}
+					if (params.strict) argv.push("--strict");
+					argv.push("--as", me);
+					break;
+				}
+				case "manifest_map": {
+					argv.push("manifest", "map");
+					if (params.limit != null) argv.push("--limit", String(params.limit));
+					if (params.strict) argv.push("--strict");
 					break;
 				}
 				case "team": {

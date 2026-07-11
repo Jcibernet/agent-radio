@@ -3,7 +3,9 @@
 //! Ported 1:1 from the original Python implementation's tests; any
 //! implementation of the protocol must pass these against its binary.
 
+use std::fs;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
@@ -27,12 +29,32 @@ impl Radio {
         c
     }
 
+    fn cmd_in(&self, dir: &Path) -> Command {
+        let mut c = self.cmd();
+        c.current_dir(dir);
+        c
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.cmd().args(args).output().unwrap()
     }
 
+    fn run_in(&self, args: &[&str], dir: &Path) -> Output {
+        self.cmd_in(dir).args(args).output().unwrap()
+    }
+
     fn ok(&self, args: &[&str]) -> String {
         let out = self.run(args);
+        assert!(
+            out.status.success(),
+            "expected success for {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn ok_in(&self, args: &[&str], dir: &Path) -> String {
+        let out = self.cmd_in(dir).args(args).output().unwrap();
         assert!(
             out.status.success(),
             "expected success for {args:?}: {}",
@@ -47,12 +69,53 @@ impl Radio {
         out
     }
 
+    fn init_git(&self, dir: &Path) {
+        let out = Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init failed");
+        let out = Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::write(dir.join(".gitkeep"), b"").unwrap();
+        let out = Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    fn work_dir(&self) -> PathBuf {
+        let wd = self.dir.path().join("repo");
+        fs::create_dir_all(&wd).unwrap();
+        self.init_git(&wd);
+        wd
+    }
+
     fn messages(&self) -> Vec<Value> {
         let path = self.dir.path().join("messages.jsonl");
         if !path.exists() {
             return Vec::new();
         }
-        std::fs::read_to_string(path)
+        fs::read_to_string(path)
             .unwrap()
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -351,6 +414,247 @@ fn wait_times_out_with_exit_1() {
         "0.05",
     ]);
     assert!(!out.status.success());
+}
+
+// ------------------------------------------------------------ manifests --
+
+#[test]
+fn manifest_digest_deterministic() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    let hello_sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    fs::write(wd.join("a.txt"), b"hello").unwrap();
+    let out = r.ok_in(&["manifest", "emit", "a.txt"], &wd);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["files"]["a.txt"], hello_sha256);
+    assert!(v["digest"].as_str().unwrap().len() == 64);
+    let digest1 = v["digest"].as_str().unwrap().to_string();
+    let out2 = r.ok_in(&["manifest", "emit", "a.txt"], &wd);
+    let v2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(v2["digest"].as_str().unwrap(), digest1);
+    assert!(out.contains("generated_at"));
+}
+
+#[test]
+fn manifest_emit_uses_git_status() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("new.txt"), b"content").unwrap();
+    let out = r.ok_in(&["manifest", "emit"], &wd);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["files"].as_object().unwrap().contains_key("new.txt"));
+}
+
+#[test]
+fn manifest_done_with_manifest_embeds() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("task.txt"), b"proof").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--kind",
+            "DONE",
+            "--body",
+            "done with manifest",
+            "--branch",
+            "",
+            "--task",
+            "task-42",
+            "--manifest",
+            "task.txt",
+        ],
+        &wd,
+    );
+    let msgs = r.messages();
+    assert_eq!(msgs.len(), 1);
+    let m = &msgs[0];
+    assert_eq!(m["task"], "task-42");
+    assert!(m.get("manifest").is_some());
+    let files = m["manifest"]["files"].as_object().unwrap();
+    assert!(files.contains_key("task.txt"));
+    assert!(m["manifest"]["digest"].as_str().unwrap().len() == 64);
+}
+
+#[test]
+fn manifest_verify_ok() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("verify.txt"), b"stable").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "check",
+            "--branch",
+            "",
+            "--manifest",
+            "verify.txt",
+        ],
+        &wd,
+    );
+    r.ok_in(&["history", "--as", "human"], &wd);
+    let out = r.ok_in(&["manifest", "verify", "1", "--as", "human"], &wd);
+    assert!(out.contains("OK"));
+    assert!(out.contains("VERIFICADO"));
+}
+
+#[test]
+fn manifest_verify_mismatch() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("alter.txt"), b"original").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "check",
+            "--branch",
+            "",
+            "--manifest",
+            "alter.txt",
+        ],
+        &wd,
+    );
+    fs::write(wd.join("alter.txt"), b"modified").unwrap();
+    r.ok_in(&["history", "--as", "human"], &wd);
+    let out = r.run_in(&["manifest", "verify", "1", "--as", "human"], &wd);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MISMATCH") || stderr.contains("MISMATCH"));
+}
+
+#[test]
+fn manifest_verify_missing() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("gone.txt"), b"temp").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "check",
+            "--branch",
+            "",
+            "--manifest",
+            "gone.txt",
+        ],
+        &wd,
+    );
+    fs::remove_file(wd.join("gone.txt")).unwrap();
+    r.ok_in(&["history", "--as", "human"], &wd);
+    let out = r.run_in(&["manifest", "verify", "1", "--as", "human"], &wd);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MISSING"));
+}
+
+#[test]
+fn manifest_verify_strict_orphan() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("claimed.txt"), b"mine").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "check",
+            "--branch",
+            "",
+            "--manifest",
+            "claimed.txt",
+        ],
+        &wd,
+    );
+    fs::write(wd.join("orphan.txt"), b"unclaimed").unwrap();
+    r.ok_in(&["history", "--as", "human"], &wd);
+    let out = r.run_in(
+        &["manifest", "verify", "1", "--as", "human", "--strict"],
+        &wd,
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HUERFANO") || stderr.contains("orphan.txt"));
+}
+
+#[test]
+fn manifest_map_dedup_by_task() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("a.txt"), b"first").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "first",
+            "--branch",
+            "",
+            "--task",
+            "shared-task",
+            "--manifest",
+            "a.txt",
+        ],
+        &wd,
+    );
+    fs::write(wd.join("b.txt"), b"second").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "second",
+            "--branch",
+            "",
+            "--task",
+            "shared-task",
+            "--manifest",
+            "b.txt",
+        ],
+        &wd,
+    );
+    let out = r.ok_in(&["manifest", "map", "--limit", "10"], &wd);
+    assert!(out.contains("shared-task"));
+    assert!(out.contains("b.txt"));
+}
+
+#[test]
+fn manifest_backward_compat_messages_without_manifest() {
+    let r = Radio::new();
+    send(&r, "a", "b", "plain message");
+    let out = r.ok(&["inbox", "--as", "b"]);
+    assert!(out.contains("plain message"));
+    assert!(!out.contains("[manifest"));
 }
 
 // ---------------------------------------------------- contract gap tests --
