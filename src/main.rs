@@ -301,6 +301,108 @@ fn make_manifest(paths: &[String]) -> Map<String, Value> {
     m
 }
 
+fn manifest_option_count(manifest: &[String], no_manifest: bool, manifest_auto: bool) -> usize {
+    usize::from(!manifest.is_empty()) + usize::from(no_manifest) + usize::from(manifest_auto)
+}
+
+fn validate_manifest_options(manifest: &[String], no_manifest: bool, manifest_auto: bool) {
+    if manifest_option_count(manifest, no_manifest, manifest_auto) > 1 {
+        die("agent-radio: --manifest, --manifest-auto and --no-manifest are mutually exclusive");
+    }
+}
+
+fn enforce_done_manifest_policy(
+    kind: &str,
+    manifest: &[String],
+    no_manifest: bool,
+    manifest_auto: bool,
+) {
+    let required = std::env::var("AGENT_RADIO_REQUIRE_MANIFEST").is_ok_and(|v| v == "1");
+    let has_option = manifest_option_count(manifest, no_manifest, manifest_auto) > 0;
+    if required && kind.to_uppercase() == "DONE" && !has_option {
+        die(
+            "agent-radio: DONE sin manifiesto: adjuntá --manifest <archivos> o declarà \
+             --no-manifest si la tarea no editó archivos",
+        );
+    }
+}
+
+fn insert_requested_manifest(
+    msg: &mut Map<String, Value>,
+    manifest: &[String],
+    no_manifest: bool,
+    manifest_auto: bool,
+) {
+    if manifest_auto {
+        let dirty_paths = git_status_files();
+        if !dirty_paths.is_empty() {
+            let m = make_manifest(&dirty_paths);
+            msg.insert("manifest".into(), json!(m));
+        }
+    } else if no_manifest {
+        // Explicit declaration for enforcement only; it is not persisted.
+    } else if !manifest.is_empty() {
+        let m = make_manifest(manifest);
+        msg.insert("manifest".into(), json!(m));
+    }
+}
+
+/// Simple glob matcher: `*` matches any chars except `/`, `**` matches any chars including `/`.
+/// Other chars match literally. Split on `/` and match segment by segment.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = path.split('/').collect();
+    glob_match_segs(&pat, &segs)
+}
+
+fn glob_match_segs(pat: &[&str], segs: &[&str]) -> bool {
+    match (pat.is_empty(), segs.is_empty()) {
+        (true, true) => return true,
+        (true, false) => return false,
+        (false, true) => return pat.iter().all(|p| *p == "**"),
+        _ => {}
+    }
+    if pat[0] == "**" {
+        // ** matches zero or more segments
+        if glob_match_segs(&pat[1..], segs) {
+            return true;
+        }
+        for i in 1..=segs.len() {
+            if glob_match_segs(&pat[1..], &segs[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if !segment_match(pat[0], segs[0]) {
+        return false;
+    }
+    glob_match_segs(&pat[1..], &segs[1..])
+}
+
+fn segment_match(pattern: &str, segment: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = segment.chars().collect();
+    seg_match_chars(&p, &s, 0, 0)
+}
+
+fn seg_match_chars(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
+    if pi == p.len() {
+        return si == s.len();
+    }
+    if p[pi] == '*' {
+        if si >= s.len() {
+            return seg_match_chars(p, s, pi + 1, si);
+        }
+        seg_match_chars(p, s, pi + 1, si) || seg_match_chars(p, s, pi, si + 1)
+    } else {
+        if si >= s.len() || p[pi] != s[si] {
+            return false;
+        }
+        seg_match_chars(p, s, pi + 1, si + 1)
+    }
+}
+
 fn load_messages(s: &Store) -> Vec<Map<String, Value>> {
     let Ok(text) = fs::read_to_string(&s.messages) else {
         return Vec::new();
@@ -668,10 +770,19 @@ fn cmd_send(args: &SendArgs) {
         None,
     );
     let mut msg = msg;
-    if !args.manifest.is_empty() {
-        let m = make_manifest(&args.manifest);
-        msg.insert("manifest".into(), json!(m));
-    }
+    validate_manifest_options(&args.manifest, args.no_manifest, args.manifest_auto);
+    enforce_done_manifest_policy(
+        str_field(&msg, "kind"),
+        &args.manifest,
+        args.no_manifest,
+        args.manifest_auto,
+    );
+    insert_requested_manifest(
+        &mut msg,
+        &args.manifest,
+        args.no_manifest,
+        args.manifest_auto,
+    );
     if let Some(t) = &args.task {
         if !t.is_empty() {
             msg.insert("task".into(), json!(t));
@@ -797,6 +908,7 @@ fn cmd_manifest_verify(
     number: Option<usize>,
     task: Option<String>,
     strict: bool,
+    ignore: &[String],
     as_agent: Option<String>,
 ) {
     let s = store();
@@ -831,6 +943,15 @@ fn cmd_manifest_verify(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let mut claimed_files: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (path_str, hash_val) in &files {
+        claimed_files.insert(path_str.clone(), hash_val.as_str().map(str::to_string));
+    }
+    let computed_digest = compute_manifest_digest(&claimed_files);
+    if computed_digest != reported_digest {
+        eprintln!("DIGEST corrupto (manifiesto editado a mano?)");
+        exit(2);
+    }
 
     let task_label = {
         let t = str_field(&msg, "task");
@@ -845,7 +966,6 @@ fn cmd_manifest_verify(
     let mut has_errors = false;
     let mut has_orphans = false;
     let mut all_claimed = BTreeSet::new();
-    let mut recomputed_files: BTreeMap<String, Option<String>> = BTreeMap::new();
 
     let mut sorted_paths: Vec<&String> = files.keys().collect();
     sorted_paths.sort();
@@ -863,7 +983,6 @@ fn cmd_manifest_verify(
                 let computed = sha256_file(&abs_path).unwrap_or_default();
                 if computed == rep {
                     println!("OK {path_str}");
-                    recomputed_files.insert(path_str.clone(), Some(computed));
                 } else {
                     println!(
                         "MISMATCH {path_str} (reportado {}… != disco {}…)",
@@ -871,41 +990,26 @@ fn cmd_manifest_verify(
                         &computed[..12.min(computed.len())]
                     );
                     has_errors = true;
-                    recomputed_files.insert(path_str.clone(), Some(computed));
                 }
             }
             (true, None) => {
                 println!("MISMATCH {path_str} (reportado (deleted) != disco present)");
                 has_errors = true;
-                let computed = sha256_file(&abs_path);
-                recomputed_files.insert(path_str.clone(), computed);
             }
             (false, Some(_rep)) => {
                 println!("MISSING {path_str}");
                 has_errors = true;
-                recomputed_files.insert(path_str.clone(), None);
             }
             (false, None) => {
                 println!("OK {path_str}");
-                recomputed_files.insert(path_str.clone(), None);
             }
         }
-    }
-
-    let computed_digest = compute_manifest_digest(&recomputed_files);
-    if computed_digest != reported_digest {
-        eprintln!(
-            "agent-radio: digest mismatch (reportado {}… != computado {}…)",
-            &reported_digest[..12.min(reported_digest.len())],
-            &computed_digest[..12.min(computed_digest.len())]
-        );
-        has_errors = true;
     }
 
     if strict {
         let dirty = git_status_files();
         for d in dirty {
-            if !all_claimed.contains(&d) {
+            if !all_claimed.contains(&d) && !ignore.iter().any(|pattern| glob_match(pattern, &d)) {
                 eprintln!("HUERFANO {d}");
                 has_orphans = true;
             }
@@ -929,7 +1033,7 @@ fn cmd_manifest_verify(
     }
 }
 
-fn cmd_manifest_map(limit: usize, strict: bool) {
+fn cmd_manifest_map(limit: usize, strict: bool, ignore: &[String]) {
     let s = store();
     let all_msgs = load_messages(&s);
 
@@ -1024,7 +1128,7 @@ fn cmd_manifest_map(limit: usize, strict: bool) {
     if strict {
         let dirty = git_status_files();
         for d in dirty {
-            if !all_claimed.contains(&d) {
+            if !all_claimed.contains(&d) && !ignore.iter().any(|pattern| glob_match(pattern, &d)) {
                 eprintln!("HUERFANO {d}");
                 has_orphans = true;
             }
@@ -1045,6 +1149,8 @@ fn cmd_reply_kind(
     as_agent: Option<&str>,
     body: &str,
     manifest: &[String],
+    no_manifest: bool,
+    manifest_auto: bool,
 ) {
     let s = store();
     let me = agent_from_env(as_agent);
@@ -1080,10 +1186,9 @@ fn cmd_reply_kind(
             Some(&original_id),
             Some(&thread).filter(|t| !t.is_empty()).map(String::as_str),
         );
-        if !manifest.is_empty() {
-            let m = make_manifest(manifest);
-            msg.insert("manifest".into(), json!(m));
-        }
+        validate_manifest_options(manifest, no_manifest, manifest_auto);
+        enforce_done_manifest_policy(kind, manifest, no_manifest, manifest_auto);
+        insert_requested_manifest(&mut msg, manifest, no_manifest, manifest_auto);
         let mut messages = load_messages(&s);
         append_message(&s, &msg);
         messages.push(msg.clone());
@@ -1203,8 +1308,14 @@ struct SendArgs {
     #[arg(long)]
     task: Option<String>,
     /// paths to include in manifest (hashed at send time)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["no_manifest", "manifest_auto"])]
     manifest: Vec<String>,
+    /// explicitly declare no manifest for this message
+    #[arg(long, conflicts_with_all = ["manifest", "manifest_auto"])]
+    no_manifest: bool,
+    /// include a manifest for all dirty files from git status
+    #[arg(long, conflicts_with_all = ["manifest", "no_manifest"])]
+    manifest_auto: bool,
 }
 
 #[derive(clap::Args)]
@@ -1217,8 +1328,14 @@ struct ReplyArgs {
     #[arg(long, default_value = "")]
     body: String,
     /// paths to include in manifest (hashed at reply time)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["no_manifest", "manifest_auto"])]
     manifest: Vec<String>,
+    /// explicitly declare no manifest for this reply
+    #[arg(long, conflicts_with_all = ["manifest", "manifest_auto"])]
+    no_manifest: bool,
+    /// include a manifest for all dirty files from git status
+    #[arg(long, conflicts_with_all = ["manifest", "no_manifest"])]
+    manifest_auto: bool,
 }
 
 #[derive(clap::Args)]
@@ -1241,6 +1358,9 @@ struct ManifestVerifyArgs {
     /// also check for unclaimed dirty files in worktree
     #[arg(long)]
     strict: bool,
+    /// glob pattern to exclude from strict orphan checks (repeatable)
+    #[arg(long)]
+    ignore: Vec<String>,
     /// agent identity (required with NUMBER)
     #[arg(long = "as")]
     as_agent: Option<String>,
@@ -1252,6 +1372,9 @@ struct ManifestMapArgs {
     limit: usize,
     #[arg(long)]
     strict: bool,
+    /// glob pattern to exclude from strict orphan checks (repeatable)
+    #[arg(long)]
+    ignore: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -1336,7 +1459,15 @@ fn main() {
             with_agent.as_deref(),
             branch.as_deref(),
         ),
-        Cmd::Ack(a) => cmd_reply_kind("ACK", a.number, a.as_agent.as_deref(), &a.body, &a.manifest),
+        Cmd::Ack(a) => cmd_reply_kind(
+            "ACK",
+            a.number,
+            a.as_agent.as_deref(),
+            &a.body,
+            &a.manifest,
+            a.no_manifest,
+            a.manifest_auto,
+        ),
         Cmd::Done(a) => {
             cmd_reply_kind(
                 "DONE",
@@ -1344,6 +1475,8 @@ fn main() {
                 a.as_agent.as_deref(),
                 &a.body,
                 &a.manifest,
+                a.no_manifest,
+                a.manifest_auto,
             );
         }
         Cmd::Decline(a) => cmd_reply_kind(
@@ -1352,6 +1485,8 @@ fn main() {
             a.as_agent.as_deref(),
             &a.body,
             &a.manifest,
+            a.no_manifest,
+            a.manifest_auto,
         ),
         Cmd::Failure(a) => cmd_reply_kind(
             "FAILURE",
@@ -1359,11 +1494,15 @@ fn main() {
             a.as_agent.as_deref(),
             &a.body,
             &a.manifest,
+            a.no_manifest,
+            a.manifest_auto,
         ),
         Cmd::Manifest(command) => match command {
             ManifestCmd::Emit(a) => cmd_manifest_emit(a.task, a.paths),
-            ManifestCmd::Verify(a) => cmd_manifest_verify(a.number, a.task, a.strict, a.as_agent),
-            ManifestCmd::Map(a) => cmd_manifest_map(a.limit, a.strict),
+            ManifestCmd::Verify(a) => {
+                cmd_manifest_verify(a.number, a.task, a.strict, &a.ignore, a.as_agent);
+            }
+            ManifestCmd::Map(a) => cmd_manifest_map(a.limit, a.strict, &a.ignore),
         },
         Cmd::Team => cmd_team(),
         Cmd::Status { as_agent, quiet } => cmd_status(as_agent.as_deref(), quiet),

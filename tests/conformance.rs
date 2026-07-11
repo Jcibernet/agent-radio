@@ -773,3 +773,399 @@ fn replying_to_own_message_targets_recipient() {
     assert_eq!(reply["to"], "b");
     assert_eq!(reply["from"], "a");
 }
+
+#[test]
+fn manifest_require_env_done_without_manifest_fails() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("workfile.txt"), b"dirty").unwrap();
+
+    let mut c = r.cmd_in(&wd);
+    c.env("AGENT_RADIO_REQUIRE_MANIFEST", "1");
+    let out = c
+        .args([
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--kind",
+            "DONE",
+            "--body",
+            "no manifest",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("DONE sin manifiesto"));
+    assert!(r.messages().is_empty());
+}
+
+#[test]
+fn manifest_require_env_done_with_no_manifest_ok() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("workfile.txt"), b"dirty").unwrap();
+
+    let mut c = r.cmd_in(&wd);
+    c.env("AGENT_RADIO_REQUIRE_MANIFEST", "1");
+    let out = c
+        .args([
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--kind",
+            "DONE",
+            "--body",
+            "explicit",
+            "--no-manifest",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let msgs = r.messages();
+    assert_eq!(msgs.len(), 1);
+    assert!(msgs[0].get("manifest").is_none());
+}
+
+#[test]
+fn manifest_require_env_done_with_manifest_ok() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("workfile.txt"), b"dirty").unwrap();
+
+    let mut c = r.cmd_in(&wd);
+    c.env("AGENT_RADIO_REQUIRE_MANIFEST", "1");
+    let out = c
+        .args([
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--kind",
+            "DONE",
+            "--body",
+            "with manifest",
+            "--manifest",
+            "workfile.txt",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let msgs = r.messages();
+    assert_eq!(msgs.len(), 1);
+    assert!(msgs[0].get("manifest").is_some());
+}
+
+#[test]
+fn manifest_require_env_done_reply_without_manifest_fails() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    r.ok_in(
+        &[
+            "send", "--from", "bot", "--to", "human", "--kind", "ASK", "--body", "question",
+        ],
+        &wd,
+    );
+    r.ok_in(&["inbox", "--as", "human"], &wd);
+
+    let mut c = r.cmd_in(&wd);
+    c.env("AGENT_RADIO_REQUIRE_MANIFEST", "1");
+    let out = c
+        .args(["done", "1", "--as", "human", "--body", "reply"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("DONE sin manifiesto"));
+
+    let mut c = r.cmd_in(&wd);
+    c.env("AGENT_RADIO_REQUIRE_MANIFEST", "1");
+    let out = c
+        .args([
+            "done",
+            "1",
+            "--as",
+            "human",
+            "--body",
+            "reply",
+            "--no-manifest",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn manifest_require_env_not_set_still_works() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    let out = r.run_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--kind",
+            "DONE",
+            "--body",
+            "no manifest no flag",
+        ],
+        &wd,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn manifest_auto_embeds_dirty_files() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("a.txt"), b"a").unwrap();
+    fs::write(wd.join("b.txt"), b"b").unwrap();
+
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "auto",
+            "--manifest-auto",
+        ],
+        &wd,
+    );
+
+    let msgs = r.messages();
+    let files = msgs[0]["manifest"]["files"].as_object().unwrap();
+    assert!(files.contains_key("a.txt"));
+    assert!(files.contains_key("b.txt"));
+}
+
+#[test]
+fn manifest_auto_and_manifest_conflict() {
+    let r = Radio::new();
+    assert!(!r
+        .run(&[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "both",
+            "--manifest-auto",
+            "--manifest",
+            "x.txt",
+        ])
+        .status
+        .success());
+    assert!(!r
+        .run(&[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "mixed",
+            "--manifest-auto",
+            "--no-manifest",
+        ])
+        .status
+        .success());
+    assert!(!r
+        .run(&[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "mixed2",
+            "--manifest",
+            "x.txt",
+            "--no-manifest",
+        ])
+        .status
+        .success());
+}
+
+#[test]
+fn manifest_verify_strict_ignore_orphans() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("claimed.txt"), b"claimed").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "claim",
+            "--manifest",
+            "claimed.txt",
+        ],
+        &wd,
+    );
+    fs::write(wd.join("orphan.txt"), b"orphan").unwrap();
+    fs::write(wd.join("build.lock"), b"lock").unwrap();
+    r.ok_in(&["history", "--as", "human"], &wd);
+
+    let out = r.run_in(
+        &[
+            "manifest", "verify", "1", "--as", "human", "--strict", "--ignore", "*.lock",
+        ],
+        &wd,
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HUERFANO"));
+    assert!(stderr.contains("orphan.txt"));
+    assert!(!stderr.contains("build.lock"));
+
+    let out = r.run_in(
+        &[
+            "manifest", "verify", "1", "--as", "human", "--strict", "--ignore", "*.lock",
+            "--ignore", "orphan*",
+        ],
+        &wd,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn manifest_map_strict_ignore_orphans() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("claimed.txt"), b"claimed").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "claim",
+            "--manifest",
+            "claimed.txt",
+        ],
+        &wd,
+    );
+    fs::write(wd.join("orphan.txt"), b"orphan").unwrap();
+    fs::write(wd.join("build.lock"), b"lock").unwrap();
+
+    let out = r.run_in(&["manifest", "map", "--strict", "--ignore", "*.lock"], &wd);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HUERFANO"));
+    assert!(stderr.contains("orphan.txt"));
+    assert!(!stderr.contains("build.lock"));
+
+    let out = r.run_in(&["manifest", "map", "--strict", "--ignore", "*"], &wd);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("HUERFANO"));
+}
+
+#[test]
+fn manifest_digest_corrupt_detected() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("digest.txt"), b"stable").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "digest",
+            "--manifest",
+            "digest.txt",
+        ],
+        &wd,
+    );
+    r.ok_in(&["history", "--as", "human"], &wd);
+
+    let path = r.dir.path().join("messages.jsonl");
+    let mut msg = r.messages().remove(0);
+    msg["manifest"]["digest"] = Value::String(
+        "0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000".into(),
+    );
+    fs::write(path, format!("{}\n", serde_json::to_string(&msg).unwrap())).unwrap();
+
+    let out = r.run_in(&["manifest", "verify", "1", "--as", "human"], &wd);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("DIGEST corrupto"));
+}
+
+#[test]
+fn manifest_digest_consistent_but_file_mismatch() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    fs::write(wd.join("mismatch.txt"), b"original").unwrap();
+    r.ok_in(
+        &[
+            "send",
+            "--from",
+            "bot",
+            "--to",
+            "human",
+            "--body",
+            "digest",
+            "--manifest",
+            "mismatch.txt",
+        ],
+        &wd,
+    );
+    fs::write(wd.join("mismatch.txt"), b"modified").unwrap();
+    r.ok_in(&["history", "--as", "human"], &wd);
+
+    let out = r.run_in(&["manifest", "verify", "1", "--as", "human"], &wd);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("MISMATCH"));
+    assert!(stdout.contains("mismatch.txt"));
+    assert!(!stdout.contains("DIGEST"));
+    assert!(!stderr.contains("DIGEST"));
+}

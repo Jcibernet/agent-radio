@@ -38,7 +38,7 @@ const factory: CustomToolFactory = (pi) => {
 			"inbox (unread for me; peek=true to not mark read),",
 			"history (recent traffic; limit/with filters),",
 			"ack/done/decline/failure (reply to a numbered message from the last inbox/history view),",
-			"manifest_emit/manifest_verify/manifest_map (hash and verify task manifests),",
+			"manifest_emit/manifest_verify/manifest_map (hash and verify task manifests; send/replies support manifest_auto and no_manifest),",
 			"team (known agents), status (unread count), wait (block until a message arrives).",
 			"Bodies are plain prose, no secrets (the script rejects credential-looking text).",
 		].join(" "),
@@ -86,6 +86,22 @@ const factory: CustomToolFactory = (pi) => {
 				.array(z.string())
 				.optional()
 				.describe("send/replies: paths to include in a manifest"),
+			no_manifest: z
+				.boolean()
+				.optional()
+				.describe(
+					"send/replies: explicitly declare no manifest (escape for investigation tasks)",
+				),
+			manifest_auto: z
+				.boolean()
+				.optional()
+				.describe("send/replies: hash ALL dirty worktree files"),
+			ignore: z
+				.array(z.string())
+				.optional()
+				.describe(
+					"manifest_verify/manifest_map: glob patterns to exclude from orphan check",
+				),
 			strict: z
 				.boolean()
 				.optional()
@@ -126,6 +142,8 @@ const factory: CustomToolFactory = (pi) => {
 					if (params.risk) argv.push("--risk", params.risk);
 					if (params.priority) argv.push("--priority", params.priority);
 					if (params.task) argv.push("--task", params.task);
+					if (params.no_manifest) argv.push("--no-manifest");
+					if (params.manifest_auto) argv.push("--manifest-auto");
 					for (const m of params.manifest ?? []) argv.push("--manifest", m);
 					break;
 				}
@@ -151,6 +169,8 @@ const factory: CustomToolFactory = (pi) => {
 					}
 					argv.push(params.op, String(params.number), "--as", me);
 					if (params.body) argv.push("--body", params.body);
+					if (params.no_manifest) argv.push("--no-manifest");
+					if (params.manifest_auto) argv.push("--manifest-auto");
 					for (const m of params.manifest ?? []) argv.push("--manifest", m);
 					break;
 				}
@@ -170,6 +190,8 @@ const factory: CustomToolFactory = (pi) => {
 						throw new Error("manifest_verify requires 'number' or 'task'");
 					}
 					if (params.strict) argv.push("--strict");
+					for (const pattern of params.ignore ?? [])
+						argv.push("--ignore", pattern);
 					argv.push("--as", me);
 					break;
 				}
@@ -177,6 +199,8 @@ const factory: CustomToolFactory = (pi) => {
 					argv.push("manifest", "map");
 					if (params.limit != null) argv.push("--limit", String(params.limit));
 					if (params.strict) argv.push("--strict");
+					for (const pattern of params.ignore ?? [])
+						argv.push("--ignore", pattern);
 					break;
 				}
 				case "team": {
