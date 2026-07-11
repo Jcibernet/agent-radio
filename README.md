@@ -1,5 +1,12 @@
 <p align="center">
-  <img src="assets/logo.svg" width="160" alt="agent-radio — una torre emisora y tres agentes escuchando" />
+  <img src=".github/banner.png" width="100%" alt="agent-radio — file-backed bus for coding agents" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/Jcibernet/agent-radio/releases"><img src="https://img.shields.io/github/v/release/Jcibernet/agent-radio?style=for-the-badge&color=FBBF24&labelColor=0B1120&label=RELEASE" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-FBBF24?style=for-the-badge&labelColor=0B1120" alt="license"></a>
+  <img src="https://img.shields.io/badge/RUST-CLI-38BDF8?style=for-the-badge&labelColor=0B1120" alt="rust cli">
+  <img src="https://img.shields.io/badge/NO_DAEMON-FILESYSTEM_ONLY-34D399?style=for-the-badge&labelColor=0B1120" alt="no daemon">
 </p>
 
 # agent-radio

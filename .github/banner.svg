@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" viewBox="0 0 900 300" role="img" aria-label="agent-radio">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#05030f"/>
+      <stop offset="0.52" stop-color="#0b1022"/>
+      <stop offset="1" stop-color="#05030f"/>
+    </linearGradient>
+
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff7ad"/>
+      <stop offset="0.48" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#d97706"/>
+    </linearGradient>
+
+    <linearGradient id="cyan" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b9f4ff"/>
+      <stop offset="0.55" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+
+    <filter id="glow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <filter id="glowSoft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="2.4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+      <path d="M30 0H0V30" fill="none" stroke="#10204a" stroke-width="1" opacity="0.46"/>
+    </pattern>
+
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1.5" fill="#000" opacity="0.08"/>
+    </pattern>
+  </defs>
+
+  <!-- arcade cabinet background -->
+  <rect width="900" height="300" rx="18" fill="url(#bg)"/>
+  <rect width="900" height="300" rx="18" fill="url(#grid)"/>
+  <rect x="6" y="6" width="888" height="288" rx="14" fill="none" stroke="#fbbf24" stroke-width="3" opacity="0.92" filter="url(#glow)"/>
+  <rect x="14" y="14" width="872" height="272" rx="10" fill="none" stroke="#38bdf8" stroke-width="1.5" opacity="0.34"/>
+
+  <!-- HUD -->
+  <text x="34" y="44" font-family="'Courier New', ui-monospace, monospace" font-size="15" font-weight="700" letter-spacing="2" fill="#38bdf8" filter="url(#glowSoft)">AGENT 1</text>
+  <text x="34" y="64" font-family="'Courier New', ui-monospace, monospace" font-size="13" font-weight="700" letter-spacing="2" fill="#fbbf24">RADIO x3</text>
+  <text x="866" y="44" text-anchor="end" font-family="'Courier New', ui-monospace, monospace" font-size="15" font-weight="700" letter-spacing="2" fill="#fbbf24" filter="url(#glowSoft)">MESSAGES</text>
+  <text x="866" y="64" text-anchor="end" font-family="'Courier New', ui-monospace, monospace" font-size="13" font-weight="700" letter-spacing="2" fill="#34d399">JSONL + FLOCK</text>
+
+  <!-- little message LEDs -->
+  <g filter="url(#glowSoft)">
+    <rect x="407" y="32" width="16" height="16" rx="4" fill="#38bdf8"/>
+    <rect x="431" y="32" width="16" height="16" rx="4" fill="#34d399"/>
+    <rect x="455" y="32" width="16" height="16" rx="4" fill="#fb7185"/>
+    <path d="M423 40H431M447 40H455" stroke="#fbbf24" stroke-width="3" stroke-linecap="round" opacity="0.75"/>
+  </g>
+
+  <!-- radio tower left -->
+  <g transform="translate(70 72)" filter="url(#glowSoft)">
+    <g fill="none" stroke="#fbbf24" stroke-linecap="round">
+      <path d="M 56 48 A 22 22 0 0 1 56 20" stroke-width="6" opacity="0.95"/>
+      <path d="M 43 59 A 39 39 0 0 1 43 9" stroke-width="5" opacity="0.62"/>
+      <path d="M 29 70 A 57 57 0 0 1 29 -2" stroke-width="4" opacity="0.35"/>
+      <path d="M 100 48 A 22 22 0 0 0 100 20" stroke-width="6" opacity="0.95"/>
+      <path d="M 113 59 A 39 39 0 0 0 113 9" stroke-width="5" opacity="0.62"/>
+      <path d="M 127 70 A 57 57 0 0 0 127 -2" stroke-width="4" opacity="0.35"/>
+    </g>
+    <circle cx="78" cy="34" r="16" fill="#fbbf24" opacity="0.20"/>
+    <circle cx="78" cy="34" r="8" fill="#fbbf24"/>
+    <line x1="78" y1="46" x2="78" y2="142" stroke="#cbd5e1" stroke-width="8" stroke-linecap="round"/>
+    <line x1="78" y1="86" x2="45" y2="142" stroke="#64748b" stroke-width="5" stroke-linecap="round"/>
+    <line x1="78" y1="86" x2="111" y2="142" stroke="#64748b" stroke-width="5" stroke-linecap="round"/>
+    <line x1="28" y1="146" x2="128" y2="146" stroke="#334155" stroke-width="6" stroke-linecap="round"/>
+    <rect x="45" y="160" width="17" height="17" rx="5" fill="#38bdf8"/>
+    <rect x="70" y="160" width="17" height="17" rx="5" fill="#34d399"/>
+    <rect x="95" y="160" width="17" height="17" rx="5" fill="#fb7185"/>
+  </g>
+
+  <!-- file-backed message rail -->
+  <g opacity="0.85" filter="url(#glowSoft)">
+    <path d="M244 158 C325 110 385 214 460 160 S594 110 670 160" fill="none" stroke="#38bdf8" stroke-width="2" stroke-dasharray="9 9" opacity="0.48"/>
+    <g fill="#0b1120" stroke="#fbbf24" stroke-width="1.6">
+      <rect x="285" y="141" width="70" height="28" rx="5"/>
+      <rect x="514" y="141" width="70" height="28" rx="5"/>
+      <rect x="632" y="141" width="70" height="28" rx="5"/>
+    </g>
+    <text x="320" y="160" text-anchor="middle" font-family="'Courier New', ui-monospace, monospace" font-size="11" font-weight="700" fill="#fbbf24">ASK</text>
+    <text x="549" y="160" text-anchor="middle" font-family="'Courier New', ui-monospace, monospace" font-size="11" font-weight="700" fill="#fbbf24">ACK</text>
+    <text x="667" y="160" text-anchor="middle" font-family="'Courier New', ui-monospace, monospace" font-size="11" font-weight="700" fill="#fbbf24">DONE</text>
+  </g>
+
+  <!-- TITLE -->
+  <text x="506" y="132" text-anchor="middle"
+        font-family="'Courier New', ui-monospace, monospace"
+        font-size="52" font-weight="800" letter-spacing="0"
+        fill="url(#amber)" stroke="#2a1603" stroke-width="1.5" filter="url(#glow)">AGENT-RADIO</text>
+
+  <!-- subtitle plate -->
+  <rect x="286" y="184" width="430" height="31" rx="5" fill="#0c1840" stroke="#fbbf24" stroke-width="1.5" opacity="0.88"/>
+  <text x="506" y="205" text-anchor="middle"
+        font-family="'Courier New', ui-monospace, monospace" font-size="13.5" font-weight="700" letter-spacing="0.8"
+        fill="#b9f4ff">FILE-BACKED BUS FOR CODING AGENTS</text>
+
+  <text x="506" y="244" text-anchor="middle"
+        font-family="'Courier New', ui-monospace, monospace" font-size="15" font-weight="700" letter-spacing="5"
+        fill="#fbbf24" filter="url(#glowSoft)">&#9654; TUNE IN &#9664;</text>
+
+  <text x="506" y="270" text-anchor="middle"
+        font-family="'Courier New', ui-monospace, monospace" font-size="12" font-weight="700" letter-spacing="2"
+        fill="#9cc7f5" opacity="0.72">LOCAL &#183; APPEND-ONLY JSONL &#183; NO DAEMON &#183; NO MCP</text>
+
+  <!-- terminal card right -->
+  <g transform="translate(742 101)" opacity="0.72">
+    <rect x="0" y="0" width="104" height="92" rx="8" fill="#0b1120" stroke="#334155"/>
+    <circle cx="14" cy="15" r="3" fill="#fb7185"/>
+    <circle cx="26" cy="15" r="3" fill="#fbbf24"/>
+    <circle cx="38" cy="15" r="3" fill="#34d399"/>
+    <text x="12" y="42" font-family="'Courier New', ui-monospace, monospace" font-size="9" fill="#38bdf8">$ inbox</text>
+    <text x="12" y="61" font-family="'Courier New', ui-monospace, monospace" font-size="9" fill="#fbbf24">ASK opencode</text>
+    <text x="12" y="78" font-family="'Courier New', ui-monospace, monospace" font-size="9" fill="#34d399">ACK claude</text>
+  </g>
+
+  <rect width="900" height="300" rx="18" fill="url(#scan)"/>
+</svg>
