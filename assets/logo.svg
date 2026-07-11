@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="agent-radio">
+  <!-- badge -->
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="#0B1120"/>
+
+  <!-- broadcast arcs (left) -->
+  <g fill="none" stroke="#FBBF24" stroke-linecap="round">
+    <path d="M 109.6 99.4 A 24 24 0 0 1 109.6 68.6" stroke-width="7" opacity="0.95"/>
+    <path d="M 97.4 109.7 A 40 40 0 0 1 97.4 58.3" stroke-width="6" opacity="0.6"/>
+    <path d="M 85.1 120.0 A 56 56 0 0 1 85.1 48.0" stroke-width="5" opacity="0.35"/>
+  </g>
+  <!-- broadcast arcs (right) -->
+  <g fill="none" stroke="#FBBF24" stroke-linecap="round">
+    <path d="M 146.4 99.4 A 24 24 0 0 0 146.4 68.6" stroke-width="7" opacity="0.95"/>
+    <path d="M 158.6 109.7 A 40 40 0 0 0 158.6 58.3" stroke-width="6" opacity="0.6"/>
+    <path d="M 170.9 120.0 A 56 56 0 0 0 170.9 48.0" stroke-width="5" opacity="0.35"/>
+  </g>
+
+  <!-- beacon -->
+  <circle cx="128" cy="84" r="16" fill="#FBBF24" opacity="0.22"/>
+  <circle cx="128" cy="84" r="9" fill="#FBBF24"/>
+
+  <!-- mast -->
+  <line x1="128" y1="96" x2="128" y2="188" stroke="#CBD5E1" stroke-width="10" stroke-linecap="round"/>
+  <!-- guy wires -->
+  <line x1="128" y1="138" x2="98"  y2="188" stroke="#64748B" stroke-width="6" stroke-linecap="round"/>
+  <line x1="128" y1="138" x2="158" y2="188" stroke="#64748B" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- ground -->
+  <line x1="72" y1="192" x2="184" y2="192" stroke="#334155" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- agents listening -->
+  <rect x="87"  y="204" width="18" height="18" rx="5" fill="#38BDF8"/>
+  <rect x="119" y="204" width="18" height="18" rx="5" fill="#34D399"/>
+  <rect x="151" y="204" width="18" height="18" rx="5" fill="#FB7185"/>
+</svg>

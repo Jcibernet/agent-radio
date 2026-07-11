@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" width="160" alt="agent-radio — una torre emisora y tres agentes escuchando" />
+</p>
+
 # agent-radio
 
 A tiny, file-backed message bus for coordinating multiple local coding agents
