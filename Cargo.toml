@@ -1,6 +1,6 @@
 [package]
 name = "agent-radio"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "File-backed message bus for coordinating multiple local coding agents sharing a machine or worktree."
@@ -16,6 +16,9 @@ regex = "1"
 serde_json = "1"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

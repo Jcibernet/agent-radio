@@ -20,8 +20,12 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use clap::{Parser, Subcommand};
 use regex::Regex;
@@ -33,6 +37,11 @@ use time::OffsetDateTime;
 
 const TS_FORMAT: &[BorrowedFormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z");
+const MAX_BODY_BYTES: usize = 256 * 1024;
+const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HASH_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_MESSAGE_LINE_BYTES: usize = 1024 * 1024;
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const KINDS: [&str; 10] = [
     "ACK",
@@ -141,21 +150,149 @@ fn store() -> Store {
     }
 }
 
+fn secure_dir(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                die(&format!(
+                    "agent-radio: refusing unsafe store directory {}",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+        }
+        Err(e) => die(&format!("agent-radio: {e}")),
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+}
+
+fn is_valid_name(name: &str) -> bool {
+    NAME_RE.is_match(name)
+}
+
+fn reject_unsafe_file(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                die(&format!(
+                    "agent-radio: refusing unsafe store file {}",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => die(&format!("agent-radio: {e}")),
+    }
+}
+
+fn harden_file_permissions(file: &fs::File) {
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
+#[cfg(unix)]
+fn set_nofollow(options: &mut fs::OpenOptions) {
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn set_nofollow(_options: &mut fs::OpenOptions) {}
+
+fn read_bounded_regular(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    set_nofollow(&mut options);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => die(&format!("agent-radio: {e}")),
+    };
+    let metadata = file
+        .metadata()
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    if !metadata.is_file() {
+        die(&format!(
+            "agent-radio: refusing unsafe store file {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > max_bytes {
+        die(&format!(
+            "agent-radio: store file {} exceeds {} bytes",
+            path.display(),
+            max_bytes
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    Some(text)
+}
+
+fn write_atomic_bytes(dir: &Path, name: &str, bytes: &[u8]) {
+    if Path::new(name).components().count() != 1 {
+        die("agent-radio: invalid sidecar filename");
+    }
+    secure_dir(dir);
+    let path = dir.join(name);
+    reject_unsafe_file(&path);
+    let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+            ^ u128::from(nonce)
+    ));
+    let mut options = fs::OpenOptions::new();
+    set_nofollow(&mut options);
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&tmp)
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    harden_file_permissions(&file);
+    if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&tmp);
+        die(&format!("agent-radio: {e}"));
+    }
+    drop(file);
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        die(&format!("agent-radio: {e}"));
+    }
+}
+
 /// Exclusive advisory lock on the store; released when the guard drops.
 struct LockGuard(fs::File);
 
 fn locked(s: &Store) -> LockGuard {
-    fs::create_dir_all(&s.root).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    secure_dir(&s.root);
+    secure_dir(&s.seen_dir);
+    secure_dir(&s.views_dir);
+    secure_dir(&s.notify_dir);
+    reject_unsafe_file(&s.lock);
     // read+write (not append-only): Windows' LockFileEx rejects handles
-    // without real read/write access — the Python impl's "a+" for the
-    // same reason. Never truncated, never written; it exists to be locked.
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
+    // without real read/write access. Never truncated or written.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    set_nofollow(&mut options);
+    let file = options
         .open(&s.lock)
         .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    harden_file_permissions(&file);
     file.lock()
         .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
     LockGuard(file)
@@ -170,7 +307,7 @@ impl Drop for LockGuard {
 // ----------------------------------------------------------- validation --
 
 fn validate_name(name: &str) -> &str {
-    if !NAME_RE.is_match(name) {
+    if !is_valid_name(name) {
         die(&format!(
             "agent-radio: invalid agent name {name:?}; use letters, digits, '.', '_' or '-'"
         ));
@@ -257,10 +394,8 @@ fn empty_registry() -> Value {
 }
 
 fn load_registry(s: &Store) -> Value {
-    let text = match fs::read_to_string(&s.agents) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return empty_registry(),
-        Err(e) => die(&format!("agent-radio: {e}")),
+    let Some(text) = read_bounded_regular(&s.agents, MAX_STORE_BYTES) else {
+        return empty_registry();
     };
     let value: Value = serde_json::from_str(&text)
         .unwrap_or_else(|_| die("agent-radio: agents registry is corrupt"));
@@ -563,8 +698,48 @@ fn register_agent(s: &Store, client_id: &str, provider: Option<&str>) -> String 
 }
 
 fn sha256_file(path: &Path) -> Option<String> {
-    let data = fs::read(path).ok()?;
-    Some(sha256_bytes(&data))
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    set_nofollow(&mut options);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => die(&format!("agent-radio: {e}")),
+    };
+    let metadata = file
+        .metadata()
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    if !metadata.is_file() {
+        die(&format!(
+            "agent-radio: refusing to hash non-regular file {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_HASH_FILE_BYTES {
+        die(&format!(
+            "agent-radio: file {} exceeds {} bytes",
+            path.display(),
+            MAX_HASH_FILE_BYTES
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 /// Compute manifest digest per contract: lines "<path>:<hash>" or "<path>:(deleted)" sorted by path.
@@ -632,6 +807,48 @@ fn canonicalize_allow_missing(path: &Path) -> PathBuf {
         resolved.push(name);
     }
     resolved
+}
+
+fn safe_manifest_path(git_root: &Path, path_str: &str) -> PathBuf {
+    let path = Path::new(path_str);
+    if path_str.is_empty()
+        || path_str.len() > 4096
+        || path_str.contains('\\')
+        || path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        die(&format!("agent-radio: unsafe manifest path {path_str:?}"));
+    }
+    let resolved = canonicalize_allow_missing(&git_root.join(path));
+    if resolved.strip_prefix(git_root).is_err() {
+        die(&format!(
+            "agent-radio: manifest path {path_str:?} escapes git worktree"
+        ));
+    }
+    resolved
+}
+
+fn manifest_files(manifest: &Map<String, Value>) -> Option<BTreeMap<String, Option<String>>> {
+    let raw_files = manifest.get("files")?.as_object()?;
+    if raw_files.len() > 10_000 {
+        return None;
+    }
+    let mut files = BTreeMap::new();
+    for (path, value) in raw_files {
+        let hash = match value {
+            Value::Null => None,
+            Value::String(hash)
+                if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                Some(hash.to_ascii_lowercase())
+            }
+            _ => return None,
+        };
+        files.insert(path.clone(), hash);
+    }
+    Some(files)
 }
 
 fn collect_manifest_files(paths: &[String]) -> BTreeMap<String, Option<String>> {
@@ -776,29 +993,104 @@ fn seg_match_chars(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
     }
 }
 
+fn optional_string_within(message: &Map<String, Value>, key: &str, max: usize) -> bool {
+    message
+        .get(key)
+        .is_none_or(|value| value.as_str().is_some_and(|text| text.len() <= max))
+}
+
+fn valid_loaded_message(message: &Map<String, Value>) -> bool {
+    let Some(id) = message.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(sender) = message.get("from").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(recipient) = message.get("to").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(kind) = message.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(body) = message.get("body").and_then(Value::as_str) else {
+        return false;
+    };
+    if id.is_empty()
+        || id.len() > 256
+        || !is_valid_name(sender)
+        || sender == "all"
+        || !is_valid_name(recipient)
+        || !KINDS.contains(&kind)
+        || body.len() > MAX_BODY_BYTES
+        || message
+            .get("version")
+            .is_some_and(|version| version.as_u64().is_none())
+    {
+        return false;
+    }
+    if ![
+        ("ts", 128),
+        ("branch", 4096),
+        ("risk", 64 * 1024),
+        ("priority", 128),
+        ("reply_to", 256),
+        ("thread_id", 256),
+        ("task", 4096),
+    ]
+    .iter()
+    .all(|(key, max)| optional_string_within(message, key, *max))
+    {
+        return false;
+    }
+    message.get("focus").is_none_or(|focus| {
+        focus.as_array().is_some_and(|paths| {
+            paths.len() <= 1024
+                && paths
+                    .iter()
+                    .all(|path| path.as_str().is_some_and(|text| text.len() <= 4096))
+        })
+    })
+}
+
 fn load_messages(s: &Store) -> Vec<Map<String, Value>> {
-    let Ok(text) = fs::read_to_string(&s.messages) else {
+    let Some(text) = read_bounded_regular(&s.messages, MAX_STORE_BYTES) else {
         return Vec::new();
     };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| match v {
-            Value::Object(m) if m.get("id").is_some_and(Value::is_string) => Some(m),
-            _ => None,
-        })
-        .collect()
+    let mut messages = Vec::new();
+    let mut ids = BTreeSet::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.len() > MAX_MESSAGE_LINE_BYTES {
+            continue;
+        }
+        let Ok(Value::Object(message)) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !valid_loaded_message(&message) {
+            continue;
+        }
+        let id = str_field(&message, "id").to_string();
+        if !ids.insert(id.clone()) {
+            die(&format!("agent-radio: duplicate message id {id}"));
+        }
+        messages.push(message);
+    }
+    messages
 }
 
 fn append_message(s: &Store, msg: &Map<String, Value>) {
-    fs::create_dir_all(&s.root).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
-    let mut fh = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    secure_dir(&s.root);
+    reject_unsafe_file(&s.messages);
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    set_nofollow(&mut options);
+    let mut file = options
         .open(&s.messages)
         .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    harden_file_permissions(&file);
     let line = serde_json::to_string(msg).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
-    writeln!(fh, "{line}").unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    writeln!(file, "{line}").unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
 }
 
 fn str_field<'a>(msg: &'a Map<String, Value>, key: &str) -> &'a str {
@@ -808,6 +1100,9 @@ fn str_field<'a>(msg: &'a Map<String, Value>, key: &str) -> &'a str {
 // --------------------------------------------------------------- notify --
 
 fn notify_path(s: &Store, agent: &str) -> PathBuf {
+    if !is_valid_name(agent) || agent == "all" {
+        die("agent-radio: invalid notification recipient");
+    }
     s.notify_dir.join(format!("{agent}.flag"))
 }
 
@@ -815,11 +1110,11 @@ fn known_agents_from_messages(messages: &[Map<String, Value>]) -> BTreeSet<Strin
     let mut agents = BTreeSet::new();
     for msg in messages {
         let sender = str_field(msg, "from");
-        if !sender.is_empty() {
+        if is_valid_name(sender) && sender != "all" {
             agents.insert(sender.to_string());
         }
         let to = str_field(msg, "to");
-        if !to.is_empty() && to != "all" {
+        if is_valid_name(to) && to != "all" {
             agents.insert(to.to_string());
         }
     }
@@ -849,7 +1144,11 @@ fn set_notify_flags(s: &Store, msg: &Map<String, Value>, messages: &[Map<String,
         BTreeSet::new()
     };
     for agent in recipients {
-        let _ = fs::write(notify_path(s, &agent), str_field(msg, "id"));
+        write_atomic_bytes(
+            &s.notify_dir,
+            &format!("{agent}.flag"),
+            str_field(msg, "id").as_bytes(),
+        );
     }
 }
 
@@ -863,7 +1162,7 @@ fn clear_notify_if_caught_up(s: &Store, agent: &str, unread: &[Map<String, Value
 
 fn load_seen(s: &Store, agent: &str) -> BTreeSet<String> {
     let path = s.seen_dir.join(format!("{agent}.json"));
-    let Ok(text) = fs::read_to_string(path) else {
+    let Some(text) = read_bounded_regular(&path, MAX_STORE_BYTES) else {
         return BTreeSet::new();
     };
     serde_json::from_str::<Value>(&text)
@@ -879,14 +1178,10 @@ fn load_seen(s: &Store, agent: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-fn write_json_atomic(dir: &PathBuf, name: &str, value: &Value) {
-    fs::create_dir_all(dir).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
-    let path = dir.join(name);
-    let tmp = dir.join(format!("{name}.tmp"));
+fn write_json_atomic(dir: &Path, name: &str, value: &Value) {
     let text =
         serde_json::to_string_pretty(value).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
-    fs::write(&tmp, text).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
-    fs::rename(&tmp, &path).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    write_atomic_bytes(dir, name, text.as_bytes());
 }
 
 fn save_seen(s: &Store, agent: &str, seen: &BTreeSet<String>) {
@@ -908,7 +1203,7 @@ fn save_view(s: &Store, agent: &str, ids: &[String]) {
 
 fn load_view(s: &Store, agent: &str) -> Vec<String> {
     let path = s.views_dir.join(format!("{agent}.json"));
-    let Ok(text) = fs::read_to_string(path) else {
+    let Some(text) = read_bounded_regular(&path, MAX_STORE_BYTES) else {
         die("agent-radio: no last view; run inbox or history first");
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
@@ -941,10 +1236,20 @@ fn unread_for(s: &Store, agent: &str) -> Vec<Map<String, Value>> {
 
 // -------------------------------------------------------------- render --
 
-/// Terminal-injection guard: rendered messages must never carry control
-/// characters (CSI/OSC escapes, backspace forgery, C1 controls) into the
-/// reader's terminal. \t/\r/\n become spaces; everything else control-ish is
-/// dropped (`char::is_control` = C0 + DEL + C1), then whitespace collapses.
+/// Terminal-injection guard: rendered messages must never carry control or
+/// invisible directionality characters into the reader's terminal.
+/// Tabs/newlines become spaces; remaining whitespace collapses.
+fn is_unsafe_format_char(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
 fn sanitize(text: &str) -> String {
     let spaced: String = text
         .chars()
@@ -955,7 +1260,7 @@ fn sanitize(text: &str) -> String {
                 c
             }
         })
-        .filter(|c| !c.is_control())
+        .filter(|character| !character.is_control() && !is_unsafe_format_char(*character))
         .collect();
     spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1023,12 +1328,14 @@ fn render(s: &Store, messages: &[Map<String, Value>]) -> Vec<String> {
                     .and_then(Value::as_object)
                     .map(|o| o.len())
                     .unwrap_or(0);
-                let digest = m.get("digest").and_then(Value::as_str).unwrap_or("");
-                let short_digest = if digest.len() > 8 {
-                    &digest[..8]
-                } else {
-                    digest
-                };
+                let short_digest: String = m
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .map(sanitize)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(8)
+                    .collect();
                 lines.push(format!("    [manifest {n_files} files @{short_digest}]"));
             }
         }
@@ -1067,6 +1374,15 @@ fn make_message(
     let body = body.trim();
     if body.is_empty() {
         die("agent-radio: empty body");
+    }
+    if body.len() > MAX_BODY_BYTES {
+        die(&format!("agent-radio: body exceeds {MAX_BODY_BYTES} bytes"));
+    }
+    if focus.len() > 1024
+        || focus.iter().any(|path| path.len() > 4096)
+        || risk.is_some_and(|value| value.len() > 64 * 1024)
+    {
+        die("agent-radio: message metadata is too large");
     }
     let secret_scan = format!("{body}\n{}\n{}", risk.unwrap_or(""), focus.join("\n"));
     require_no_secret(&secret_scan);
@@ -1110,8 +1426,12 @@ fn body_arg(raw: &str) -> String {
     if raw == "-" {
         let mut buf = String::new();
         std::io::stdin()
+            .take((MAX_BODY_BYTES + 1) as u64)
             .read_to_string(&mut buf)
             .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+        if buf.len() > MAX_BODY_BYTES {
+            die(&format!("agent-radio: body exceeds {MAX_BODY_BYTES} bytes"));
+        }
         buf
     } else {
         raw.to_string()
@@ -1302,22 +1622,10 @@ fn cmd_manifest_verify(
     let manifest = msg
         .get("manifest")
         .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(|| die("agent-radio: message has no manifest"));
-    let files = manifest
-        .get("files")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(|| die("agent-radio: manifest has no files"));
-    let reported_digest = manifest
-        .get("digest")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let mut claimed_files: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for (path_str, hash_val) in &files {
-        claimed_files.insert(path_str.clone(), hash_val.as_str().map(str::to_string));
-    }
+        .unwrap_or_else(|| die("agent-radio: message has no valid manifest"));
+    let claimed_files =
+        manifest_files(manifest).unwrap_or_else(|| die("agent-radio: manifest is corrupt"));
+    let reported_digest = manifest.get("digest").and_then(Value::as_str).unwrap_or("");
     let computed_digest = compute_manifest_digest(&claimed_files);
     if computed_digest != reported_digest {
         eprintln!("DIGEST corrupto (manifiesto editado a mano?)");
@@ -1333,23 +1641,20 @@ fn cmd_manifest_verify(
         }
     };
 
-    let git_root = git_root();
+    let git_root =
+        fs::canonicalize(git_root()).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
     let mut has_errors = false;
     let mut has_orphans = false;
     let mut all_claimed = BTreeSet::new();
 
-    let mut sorted_paths: Vec<&String> = files.keys().collect();
-    sorted_paths.sort();
-
-    for path_str in sorted_paths {
-        let hash_val = files.get(path_str).unwrap();
-        let abs_path = git_root.join(path_str);
+    for (path_str, reported_hash) in &claimed_files {
+        let abs_path = safe_manifest_path(&git_root, path_str);
         all_claimed.insert(path_str.clone());
+        let exists = abs_path
+            .try_exists()
+            .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
 
-        let exists = abs_path.exists();
-        let reported = hash_val.as_str();
-
-        match (exists, reported) {
+        match (exists, reported_hash.as_deref()) {
             (true, Some(rep)) => {
                 let computed = sha256_file(&abs_path).unwrap_or_default();
                 if computed == rep {
@@ -1419,10 +1724,9 @@ fn cmd_manifest_map(limit: usize, strict: bool, ignore: &[String]) {
         let key = {
             let t = str_field(msg, "task");
             if t.is_empty() {
-                let from = str_field(msg, "from");
-                let id = str_field(msg, "id");
-                let short = if id.len() > 8 { &id[..8] } else { id };
-                format!("{from}#{short}")
+                let from = sanitize(str_field(msg, "from"));
+                let id: String = str_field(msg, "id").chars().take(8).collect();
+                format!("{from}#{id}")
             } else {
                 t.to_string()
             }
@@ -1432,7 +1736,8 @@ fn cmd_manifest_map(limit: usize, strict: bool, ignore: &[String]) {
 
     let entries: Vec<(&String, &&Map<String, Value>)> = seen.iter().take(limit).collect();
 
-    let git_root = git_root();
+    let git_root =
+        fs::canonicalize(git_root()).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
     let mut all_ok = true;
     let mut has_orphans = false;
     let mut all_claimed: BTreeSet<String> = BTreeSet::new();
@@ -1441,28 +1746,44 @@ fn cmd_manifest_map(limit: usize, strict: bool, ignore: &[String]) {
     println!("-----|------|----|---|-----|------|-------");
 
     for (task_key, msg) in &entries {
-        let manifest = msg.get("manifest").and_then(Value::as_object).unwrap();
-        let files = manifest.get("files").and_then(Value::as_object).unwrap();
-        let n_files = files.len();
-        let digest = manifest.get("digest").and_then(Value::as_str).unwrap_or("");
-        let short_digest = if digest.len() > 8 {
-            &digest[..8]
-        } else {
-            digest
+        let Some(manifest) = msg.get("manifest").and_then(Value::as_object) else {
+            println!(
+                "{} | {} | {} | {} | 0 | - | CORRUPTO",
+                sanitize(task_key),
+                sanitize(str_field(msg, "from")),
+                sanitize(str_field(msg, "kind")),
+                sanitize(str_field(msg, "ts")),
+            );
+            all_ok = false;
+            continue;
         };
-
-        let mut ok = true;
+        let Some(files) = manifest_files(manifest) else {
+            println!(
+                "{} | {} | {} | {} | 0 | - | CORRUPTO",
+                sanitize(task_key),
+                sanitize(str_field(msg, "from")),
+                sanitize(str_field(msg, "kind")),
+                sanitize(str_field(msg, "ts")),
+            );
+            all_ok = false;
+            continue;
+        };
+        let digest = manifest.get("digest").and_then(Value::as_str).unwrap_or("");
+        let digest_valid =
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let short_digest = if digest_valid { &digest[..8] } else { "-" };
+        let mut ok = digest_valid && compute_manifest_digest(&files) == digest;
         let mut paths = Vec::new();
-        for (path_str, hash_val) in files {
-            let abs_path = git_root.join(path_str);
+        for (path_str, reported_hash) in &files {
+            let abs_path = safe_manifest_path(&git_root, path_str);
             all_claimed.insert(path_str.to_string());
-            paths.push(path_str.to_string());
-            let exists = abs_path.exists();
-            let reported = hash_val.as_str();
-            match (exists, reported) {
-                (true, Some(rep)) => {
-                    let computed = sha256_file(&abs_path).unwrap_or_default();
-                    if computed != rep {
+            paths.push(sanitize(path_str));
+            let exists = abs_path
+                .try_exists()
+                .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+            match (exists, reported_hash.as_deref()) {
+                (true, Some(reported)) => {
+                    if sha256_file(&abs_path).as_deref() != Some(reported) {
                         ok = false;
                     }
                 }
@@ -1475,7 +1796,6 @@ fn cmd_manifest_map(limit: usize, strict: bool, ignore: &[String]) {
         if !ok {
             all_ok = false;
         }
-        paths.sort();
         let estado = if ok { "VERIFICADO" } else { "NO COINCIDE" };
         let suffix = if paths.is_empty() {
             String::new()
@@ -1485,11 +1805,11 @@ fn cmd_manifest_map(limit: usize, strict: bool, ignore: &[String]) {
 
         println!(
             "{} | {} | {} | {} | {} | {} | {}{}",
-            task_key,
-            str_field(msg, "from"),
-            str_field(msg, "kind"),
+            sanitize(task_key),
+            sanitize(str_field(msg, "from")),
+            sanitize(str_field(msg, "kind")),
             sanitize(str_field(msg, "ts")),
-            n_files,
+            files.len(),
             short_digest,
             estado,
             suffix,

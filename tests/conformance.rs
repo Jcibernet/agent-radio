@@ -11,6 +11,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
 use tempfile::TempDir;
 
 struct Radio {
@@ -517,6 +521,7 @@ fn render_neutralises_overwrite_and_control_chars() {
     let r = Radio::new();
     send(&r, "a", "b", "safe line\rforged line");
     send(&r, "a", "b", "abc\x08\x08X");
+    send(&r, "a", "b", "left\u{202e}right\u{200b}end");
     // NUL cannot travel in argv (OS limitation), so it goes via stdin —
     // same store, same render path.
     let out = run_with_stdin(
@@ -531,6 +536,10 @@ fn render_neutralises_overwrite_and_control_chars() {
     assert!(rendered.contains("safe line forged line"));
     assert!(rendered.contains("abcX"));
     assert!(rendered.contains("abc31mde"));
+    assert!(rendered.contains("leftrightend"));
+    assert!(!rendered
+        .chars()
+        .any(|character| matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')));
     assert!(!rendered.chars().any(|c| c.is_control() && c != '\n'));
 }
 
@@ -1443,4 +1452,176 @@ fn manifest_digest_consistent_but_file_mismatch() {
     assert!(stdout.contains("mismatch.txt"));
     assert!(!stdout.contains("DIGEST"));
     assert!(!stderr.contains("DIGEST"));
+}
+
+// ------------------------------------------------ security regressions --
+
+#[cfg(unix)]
+#[test]
+fn store_and_sidecars_are_private_by_default() {
+    let r = Radio::new();
+    r.ok(&[
+        "register",
+        "--client-id",
+        "security-session",
+        "--provider",
+        "test",
+    ]);
+    send(&r, "Alice", "Bob", "private");
+
+    for dir in ["", "seen", "views", "notify"] {
+        let mode = fs::metadata(r.dir.path().join(dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{dir:?} must be private");
+    }
+    for file in ["lock", "agents.json", "messages.jsonl", "notify/Bob.flag"] {
+        let mode = fs::metadata(r.dir.path().join(file))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{file} must be private");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn poisoned_message_identity_cannot_write_outside_notify_dir() {
+    let r = Radio::new();
+    let victim_base = r.dir.path().join("victim");
+    let victim_flag = r.dir.path().join("victim.flag");
+    fs::write(&victim_flag, "SAFE").unwrap();
+    let poisoned = serde_json::json!({
+        "id": "poison",
+        "ts": "2026-01-01T00:00:00.000000Z",
+        "from": victim_base.to_string_lossy(),
+        "to": "nobody",
+        "kind": "FYI",
+        "body": "poison"
+    });
+    fs::write(r.dir.path().join("messages.jsonl"), format!("{poisoned}\n")).unwrap();
+
+    send(&r, "Alice", "all", "broadcast");
+    assert_eq!(fs::read_to_string(victim_flag).unwrap(), "SAFE");
+}
+
+#[cfg(unix)]
+#[test]
+fn predictable_atomic_temp_symlink_cannot_overwrite_victim() {
+    let r = Radio::new();
+    let victim = r.dir.path().join("victim");
+    fs::write(&victim, "SAFE").unwrap();
+    symlink(&victim, r.dir.path().join("agents.json.tmp")).unwrap();
+
+    r.ok(&["register", "--client-id", "secure-session"]);
+
+    assert_eq!(fs::read_to_string(victim).unwrap(), "SAFE");
+    assert!(!fs::symlink_metadata(r.dir.path().join("agents.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn manifest_verify_rejects_traversal_without_hashing_external_file() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    let secret = r.dir.path().join("secret.txt");
+    fs::write(&secret, b"outside secret").unwrap();
+    let reported = "0".repeat(64);
+    let claim = format!("../secret.txt:{reported}");
+    let digest = format!("{:x}", Sha256::digest(claim.as_bytes()));
+    let message = serde_json::json!({
+        "id": "evil",
+        "ts": "2026-01-01T00:00:00.000000Z",
+        "from": "Mallory",
+        "to": "Alice",
+        "kind": "DONE",
+        "body": "evil",
+        "task": "evil",
+        "manifest": {
+            "files": { "../secret.txt": reported },
+            "digest": digest
+        }
+    });
+    fs::write(r.dir.path().join("messages.jsonl"), format!("{message}\n")).unwrap();
+
+    let out = r.run_in(&["manifest", "verify", "--task", "evil"], &wd);
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let secret_hash = format!("{:x}", Sha256::digest(b"outside secret"));
+    assert!(!stdout.contains(&secret_hash[..12]));
+    assert!(stderr.contains("unsafe manifest path"));
+}
+
+#[test]
+fn malformed_manifest_map_fails_cleanly_without_panicking() {
+    let r = Radio::new();
+    let wd = r.work_dir();
+    let message = serde_json::json!({
+        "id": "bad",
+        "ts": "2026-01-01T00:00:00.000000Z",
+        "from": "Mallory",
+        "to": "Alice",
+        "kind": "DONE",
+        "body": "bad",
+        "task": "bad",
+        "manifest": null
+    });
+    fs::write(r.dir.path().join("messages.jsonl"), format!("{message}\n")).unwrap();
+
+    let out = r.run_in(&["manifest", "map"], &wd);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("CORRUPTO"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked at"));
+}
+
+#[test]
+fn duplicate_message_ids_are_rejected_as_ambiguous() {
+    let r = Radio::new();
+    let first = serde_json::json!({
+        "id": "duplicate",
+        "ts": "2026-01-01T00:00:00.000000Z",
+        "from": "Alice",
+        "to": "Bob",
+        "kind": "ASK",
+        "body": "first"
+    });
+    let second = serde_json::json!({
+        "id": "duplicate",
+        "ts": "2026-01-01T00:00:01.000000Z",
+        "from": "Charlie",
+        "to": "Bob",
+        "kind": "FYI",
+        "body": "second"
+    });
+    fs::write(
+        r.dir.path().join("messages.jsonl"),
+        format!("{first}\n{second}\n"),
+    )
+    .unwrap();
+
+    let out = r.fails(&["history"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate message id"));
+}
+
+#[test]
+fn oversized_stdin_body_is_rejected_before_append() {
+    let r = Radio::new();
+    let body = "x".repeat(256 * 1024 + 1);
+    let out = run_with_stdin(
+        &r,
+        &[
+            "send", "--from", "Alice", "--to", "Bob", "--body", "-", "--branch", "",
+        ],
+        &body,
+    );
+
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("body exceeds"));
+    assert!(r.messages().is_empty());
 }

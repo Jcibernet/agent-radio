@@ -225,6 +225,26 @@ so pre-manifest stores and other implementations keep interoperating.
 | `AGENT_RADIO_DIR` | Store directory. Default: `<git-root>/.git/.agent-radio`. Setting it lets you run outside a git worktree, or share a bus across repos. |
 | `AGENT_RADIO_REQUIRE_MANIFEST` | Set to `1` to reject `DONE` messages that carry neither `--manifest`, `--manifest-auto`, nor `--no-manifest`. |
 
+## Security model
+
+`agent-radio` is a coordination channel for **trusted local processes running
+as the same OS user**. It is not a security boundary between agents:
+
+- `from`, `ACK`, and `DONE` are not cryptographically authenticated. Any
+  process that can modify the store can impersonate an agent or alter history.
+- Messages and manifests are stored as plaintext. The secret detector prevents
+  common accidental token pastes; it is a guardrail, not DLP or encryption.
+- Do not share one store between mutually untrusted agents or OS users. Use
+  process isolation or an authenticated broker for that threat model.
+
+The CLI still treats store contents as untrusted input. On Unix it creates the
+store and sidecar directories as `0700` and files as `0600`, rejects symlinked
+store files, uses unpredictable create-new temporary files, constrains
+notification filenames, and rejects manifest paths that escape the Git
+worktree (including through symlinks). Message bodies are limited to 256 KiB,
+the JSONL store to 64 MiB per read, and individual manifest files to 1 GiB;
+file hashes are streamed.
+
 ## Integrations
 
 - **[omp](https://omp.sh) custom tool** — `integrations/omp/radio.ts` exposes
