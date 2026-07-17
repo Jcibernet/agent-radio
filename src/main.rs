@@ -607,19 +607,49 @@ fn git_status_files() -> Vec<String> {
     files
 }
 
-/// Hash paths relative to cwd, store as relative to git root.
-/// Returns Map suitable for inserting as "manifest" in a message.
-fn make_manifest(paths: &[String]) -> Map<String, Value> {
-    let git_root = git_root();
-    let mut files: BTreeMap<String, Option<String>> = BTreeMap::new();
+fn canonicalize_allow_missing(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match existing.try_exists() {
+            Ok(true) => break,
+            Ok(false) => {
+                let name = existing
+                    .file_name()
+                    .unwrap_or_else(|| die("agent-radio: invalid manifest path"))
+                    .to_os_string();
+                missing.push(name);
+                if !existing.pop() {
+                    die("agent-radio: invalid manifest path");
+                }
+            }
+            Err(e) => die(&format!("agent-radio: {e}")),
+        }
+    }
+    let mut resolved =
+        fs::canonicalize(existing).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+}
+
+fn collect_manifest_files(paths: &[String]) -> BTreeMap<String, Option<String>> {
+    let git_root =
+        fs::canonicalize(git_root()).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    let cwd = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
+    let mut files = BTreeMap::new();
     for path_str in paths {
-        let p = Path::new(path_str);
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
+        let path = Path::new(path_str);
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
         } else {
-            std::env::current_dir().unwrap_or_default().join(p)
+            cwd.join(path)
         };
-        let rel = abs
+        let absolute = canonicalize_allow_missing(&candidate);
+        let relative = absolute
             .strip_prefix(&git_root)
             .unwrap_or_else(|_| {
                 die(&format!(
@@ -627,15 +657,21 @@ fn make_manifest(paths: &[String]) -> Map<String, Value> {
                 ))
             })
             .to_string_lossy()
-            .to_string();
-        let hash = sha256_file(&abs);
-        files.insert(rel, hash);
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        files.insert(relative, sha256_file(&absolute));
     }
+    files
+}
+
+/// Hash paths relative to cwd, store as relative to git root.
+/// Returns Map suitable for inserting as "manifest" in a message.
+fn make_manifest(paths: &[String]) -> Map<String, Value> {
+    let files = collect_manifest_files(paths);
     let digest = compute_manifest_digest(&files);
-    let mut m = Map::new();
-    m.insert("files".into(), json!(files));
-    m.insert("digest".into(), json!(digest));
-    m
+    let mut manifest = Map::new();
+    manifest.insert("files".into(), json!(files));
+    manifest.insert("digest".into(), json!(digest));
+    manifest
 }
 
 fn manifest_option_count(manifest: &[String], no_manifest: bool, manifest_auto: bool) -> usize {
@@ -1227,27 +1263,7 @@ fn cmd_manifest_emit(task: Option<String>, paths: Vec<String>) {
     } else {
         paths
     };
-    let git_root = git_root();
-    let mut files: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for path_str in &paths {
-        let p = Path::new(path_str);
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_default().join(p)
-        };
-        let rel = abs
-            .strip_prefix(&git_root)
-            .unwrap_or_else(|_| {
-                die(&format!(
-                    "agent-radio: path {path_str} is outside git worktree"
-                ))
-            })
-            .to_string_lossy()
-            .to_string();
-        let hash = sha256_file(&abs);
-        files.insert(rel, hash);
-    }
+    let files = collect_manifest_files(&paths);
     let digest = compute_manifest_digest(&files);
     let mut result = Map::new();
     result.insert("generated_at".into(), json!(utc_now()));
