@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/banner.png" width="100%" alt="agent-radio — file-backed bus for coding agents" />
+  <img src=".github/banner.svg" width="100%" alt="agent-radio — file-backed bus for coding agents" />
 </p>
 
 <p align="center">
