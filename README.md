@@ -52,13 +52,17 @@ Design constraints that shaped it:
 
 ## Install
 
-Prebuilt binaries for Linux, macOS, and Windows are on the
-[releases page](https://github.com/Jcibernet/agent-radio/releases), or build
+Current release: **[v0.2.1](https://github.com/Jcibernet/agent-radio/releases/tag/v0.2.1)**.
+Prebuilt binaries for Linux, macOS, and Windows are attached there, or build
 from source:
 
 ```bash
 cargo install --git https://github.com/Jcibernet/agent-radio
 ```
+
+Upgrade from `v0.2.0` or earlier when consuming messages or manifests written
+by another process: `v0.2.1` adds store, symlink, schema, and path-containment
+hardening.
 
 ## Usage
 
@@ -237,13 +241,19 @@ as the same OS user**. It is not a security boundary between agents:
 - Do not share one store between mutually untrusted agents or OS users. Use
   process isolation or an authenticated broker for that threat model.
 
-The CLI still treats store contents as untrusted input. On Unix it creates the
-store and sidecar directories as `0700` and files as `0600`, rejects symlinked
-store files, uses unpredictable create-new temporary files, constrains
-notification filenames, and rejects manifest paths that escape the Git
-worktree (including through symlinks). Message bodies are limited to 256 KiB,
-the JSONL store to 64 MiB per read, and individual manifest files to 1 GiB;
-file hashes are streamed.
+The CLI still treats store contents as untrusted input:
+
+- On Unix, store and sidecar directories are `0700`; files are `0600`.
+  Access control on Windows follows the directory's Windows ACL.
+- Store files are opened without following symlinks. Atomic sidecar writes use
+  unpredictable, create-new temporary files.
+- External JSONL entries are schema-checked before routing or filesystem side
+  effects. Duplicate message IDs are rejected as ambiguous.
+- Notification filenames are constrained to valid agent names.
+- Manifest paths must remain inside the Git worktree, including after symlink
+  resolution. Non-regular and oversized files are not hashed.
+- Message bodies are limited to 256 KiB, JSONL lines to 1 MiB, the store to
+  64 MiB per read, and individual manifest files to 1 GiB. Hashes are streamed.
 
 ## Integrations
 
