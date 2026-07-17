@@ -69,6 +69,10 @@ export AGENT_RADIO_CLIENT_ID=claude-session-42
 export AGENT_RADIO_PROVIDER=claude          # metadata, not the routing identity
 agent-radio register                       # Alice
 
+# Optional user alias. The stable identity remains Alice.
+agent-radio rename --name Maverick          # Maverick    Alice
+agent-radio rename --reset                  # Alice
+
 # Ask another registered agent something, pointing at concrete files
 agent-radio send --to Bob --kind ASK \
   --body "Are you still touching parse_pipeline.py? I need to extend the extractor." \
@@ -93,7 +97,7 @@ agent-radio history --limit 30 --with Bob
 
 # Who's on the air / do I have mail / block until something arrives
 agent-radio team
-agent-radio status            # {"agent": ..., "unread": N, "flag": bool}
+agent-radio status            # {"agent":"Alice","display_name":"Maverick",...}
 agent-radio status --quiet    # exit 0 iff unread > 0 (for shell loops)
 agent-radio wait --timeout 300
 ```
@@ -110,6 +114,21 @@ Harnesses should create a stable, unique client id when they spawn an agent and
 keep it for that logical session. `AGENT_RADIO_AGENT` and explicit `--as` /
 `--from` remain available when a caller needs a manually chosen identity.
 
+Users can choose a custom alias with `agent-radio rename --name <name>` and
+restore the generated name with `agent-radio rename --reset`. Renaming never
+rewrites `messages.jsonl` or renames `seen`/`views`/`notify` files: `Alice`
+remains the immutable identity while the CLI renders and accepts the current
+alias. Previous aliases remain valid routing names and are never reassigned, so
+delayed commands cannot reach a different agent. `history --with`, direct
+messages, replies, status, and pending inbox messages resolve aliases back to
+the canonical identity.
+
+Custom aliases use the existing ASCII name syntax, are limited to 32
+characters, and are unique case-insensitively. `all`, generated names such as
+`Bob` or `Alice-2`, names owned by another agent, and identities already found
+in legacy message history are rejected. `team` reports display name, provider,
+last activity, and canonical identity as tab-separated columns.
+
 ### Task manifests (verified completion)
 
 "Done" is a claim; a manifest makes it checkable. A completing agent attaches
@@ -119,7 +138,7 @@ anything:
 
 ```bash
 # Completing agent: the DONE carries the evidence
-agent-radio send --to claude --kind DONE --task AuthFix \
+agent-radio send --to Bob --kind DONE --task AuthFix \
   --manifest src/auth.rs --manifest tests/auth.rs \
   --body "done: guard added, 4 new tests"
 # --manifest-auto hashes everything dirty in `git status` instead

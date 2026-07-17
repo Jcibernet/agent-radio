@@ -331,6 +331,123 @@ fn broadcast_notifies_registered_agents_before_their_first_message() {
     assert_eq!(status["flag"], true);
 }
 
+#[test]
+fn rename_is_an_alias_over_stable_identity_and_pending_messages() {
+    let r = Radio::new();
+    r.ok(&[
+        "register",
+        "--client-id",
+        "session-alice",
+        "--provider",
+        "claude",
+    ]);
+    r.ok(&["register", "--client-id", "session-bob"]);
+    send(&r, "Bob", "Alice", "before rename");
+
+    let mut alice = r.cmd();
+    alice.env("AGENT_RADIO_CLIENT_ID", "session-alice");
+    let renamed = alice
+        .args(["rename", "--name", "Maverick"])
+        .output()
+        .unwrap();
+    assert!(renamed.status.success());
+    assert_eq!(
+        String::from_utf8(renamed.stdout).unwrap().trim(),
+        "Maverick\tAlice"
+    );
+
+    let mut alice = r.cmd();
+    alice.env("AGENT_RADIO_CLIENT_ID", "session-alice");
+    let inbox = alice.args(["inbox"]).output().unwrap();
+    assert!(inbox.status.success());
+    let inbox = String::from_utf8(inbox.stdout).unwrap();
+    assert!(inbox.contains("Bob -> Maverick"));
+    assert!(inbox.contains("before rename"));
+    let reply = r.ok(&["ack", "1", "--as", "Maverick", "--body", "got it"]);
+    assert!(reply.contains("-> Bob"));
+
+    send(&r, "Bob", "Maverick", "after rename");
+    let messages = r.messages();
+    assert_eq!(messages[0]["to"], "Alice");
+    assert_eq!(messages[1]["from"], "Alice");
+    assert_eq!(messages[1]["to"], "Bob");
+    assert_eq!(messages[2]["to"], "Alice");
+    let history = r.ok(&["history", "--with", "Maverick"]);
+    assert!(history.contains("before rename"));
+    assert!(history.contains("after rename"));
+    assert!(history.contains("Bob -> Maverick"));
+
+    let mut status = r.cmd();
+    status.env("AGENT_RADIO_CLIENT_ID", "session-alice");
+    let status = status.args(["status"]).output().unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["agent"], "Alice");
+    assert_eq!(status["display_name"], "Maverick");
+    assert!(r
+        .ok(&["team"])
+        .lines()
+        .next()
+        .unwrap()
+        .starts_with("Maverick\tclaude\t"));
+}
+
+#[test]
+fn reset_keeps_previous_alias_routable_and_unavailable_to_others() {
+    let r = Radio::new();
+    r.ok(&["register", "--client-id", "session-alice"]);
+    r.ok(&["register", "--client-id", "session-bob"]);
+    r.ok(&[
+        "rename",
+        "--client-id",
+        "session-alice",
+        "--name",
+        "Maverick",
+    ]);
+    r.ok(&["rename", "--client-id", "session-alice", "--name", "Atlas"]);
+    r.ok(&["rename", "--client-id", "session-alice", "--reset"]);
+
+    send(&r, "Bob", "Maverick", "old alias");
+    assert_eq!(r.messages()[0]["to"], "Alice");
+    r.fails(&["rename", "--client-id", "session-bob", "--name", "maverick"]);
+}
+
+#[test]
+fn rename_rejects_reserved_legacy_and_concurrent_collisions() {
+    let r = Radio::new();
+    r.ok(&["register", "--client-id", "session-alice"]);
+    r.ok(&["register", "--client-id", "session-bob"]);
+    send(&r, "legacy", "Alice", "hello");
+    for name in ["all", "Bob", "Alice-2", "legacy"] {
+        r.fails(&["rename", "--client-id", "session-alice", "--name", name]);
+    }
+
+    let store = r.dir.path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["session-alice", "session-bob"]
+        .into_iter()
+        .map(|client_id| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                Command::new(env!("CARGO_BIN_EXE_agent-radio"))
+                    .env("AGENT_RADIO_DIR", store)
+                    .args(["rename", "--client-id", client_id, "--name", "Maverick"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            })
+        })
+        .collect();
+    let successes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|success| *success)
+        .count();
+    assert_eq!(successes, 1);
+}
+
 // ----------------------------------------------------------------- flow --
 
 #[test]

@@ -194,7 +194,7 @@ fn agent_from_env(explicit: Option<&str>) -> String {
             .filter(|v| !v.is_empty())
     }) {
         validate_name(&name);
-        return name;
+        return resolve_agent_name(&store(), &name);
     }
     if let Ok(client_id) = std::env::var("AGENT_RADIO_CLIENT_ID") {
         if !client_id.is_empty() {
@@ -246,6 +246,8 @@ fn sha256_bytes(data: &[u8]) -> String {
 struct RegisteredAgent {
     ordinal: u64,
     name: String,
+    display_name: Option<String>,
+    aliases: Vec<String>,
     provider: Option<String>,
     created_at: String,
 }
@@ -289,6 +291,31 @@ fn load_registered_agents(s: &Store) -> Vec<RegisteredAgent> {
                 .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"))
                 .to_string();
             validate_name(&name);
+            let display_name = record
+                .get("display_name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(value) = &display_name {
+                validate_name(value);
+            }
+            let aliases = record
+                .get("aliases")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| {
+                            let alias = value
+                                .as_str()
+                                .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"))
+                                .to_string();
+                            validate_name(&alias);
+                            alias
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let provider = record
                 .get("provider")
                 .and_then(Value::as_str)
@@ -305,12 +332,22 @@ fn load_registered_agents(s: &Store) -> Vec<RegisteredAgent> {
             RegisteredAgent {
                 ordinal,
                 name,
+                display_name,
+                aliases,
                 provider,
                 created_at,
             }
         })
         .collect();
     agents.sort_by_key(|agent| agent.ordinal);
+    let mut names = BTreeSet::new();
+    for agent in &agents {
+        for name in std::iter::once(&agent.name).chain(agent.aliases.iter()) {
+            if !names.insert(name.to_ascii_lowercase()) {
+                die("agent-radio: agents registry contains duplicate names");
+            }
+        }
+    }
     agents
 }
 
@@ -322,6 +359,153 @@ fn human_name(ordinal: u64) -> String {
     } else {
         format!("{}-{}", HUMAN_NAMES[index], generation + 1)
     }
+}
+
+fn displayed_name(agent: &RegisteredAgent) -> &str {
+    agent.display_name.as_deref().unwrap_or(&agent.name)
+}
+
+fn display_from_map<'a>(names: &'a BTreeMap<String, String>, canonical: &'a str) -> &'a str {
+    names
+        .get(canonical)
+        .map(String::as_str)
+        .unwrap_or(canonical)
+}
+
+fn resolve_agent_name(s: &Store, input: &str) -> String {
+    if input == "all" {
+        return input.to_string();
+    }
+    for agent in load_registered_agents(s) {
+        if agent.name == input || agent.aliases.iter().any(|alias| alias == input) {
+            return agent.name;
+        }
+    }
+    input.to_string()
+}
+
+fn display_agent_name(s: &Store, canonical: &str) -> String {
+    load_registered_agents(s)
+        .into_iter()
+        .find(|agent| agent.name == canonical)
+        .map(|agent| displayed_name(&agent).to_string())
+        .unwrap_or_else(|| canonical.to_string())
+}
+
+fn is_generated_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HUMAN_NAMES.iter().any(|base| {
+        let base = base.to_ascii_lowercase();
+        lower == base
+            || lower
+                .strip_prefix(&(base + "-"))
+                .is_some_and(|suffix| suffix.parse::<u64>().is_ok_and(|value| value >= 2))
+    })
+}
+
+fn rename_agent(s: &Store, client_id: &str, new_name: Option<&str>) -> (String, String) {
+    if client_id.is_empty() {
+        die("agent-radio: client id must not be empty");
+    }
+    if let Some(name) = new_name {
+        validate_name(name);
+        if name.chars().count() > 32 {
+            die("agent-radio: custom agent names are limited to 32 characters");
+        }
+        if name.eq_ignore_ascii_case("all") {
+            die("agent-radio: 'all' is reserved for broadcasts");
+        }
+    }
+
+    let client_key = sha256_bytes(client_id.as_bytes());
+    let _guard = locked(s);
+    let mut registry = load_registry(s);
+    let registered = load_registered_agents(s);
+    let current = registered
+        .iter()
+        .find(|agent| {
+            registry
+                .get("agents")
+                .and_then(Value::as_object)
+                .and_then(|records| records.get(&client_key))
+                .and_then(|record| record.get("name"))
+                .and_then(Value::as_str)
+                == Some(agent.name.as_str())
+        })
+        .cloned()
+        .unwrap_or_else(|| die("agent-radio: register this client id before renaming it"));
+    let target = new_name
+        .filter(|name| !name.eq_ignore_ascii_case(&current.name))
+        .map(|name| {
+            current
+                .aliases
+                .iter()
+                .find(|alias| alias.eq_ignore_ascii_case(name))
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
+        });
+
+    if let Some(name) = target.as_deref() {
+        if is_generated_name(name) {
+            die("agent-radio: automatically assigned names are reserved");
+        }
+        let owned_by_current = current
+            .aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(name));
+        let collides_with_registered = registered.iter().any(|agent| {
+            agent.name.eq_ignore_ascii_case(name)
+                || agent
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name))
+        });
+        if collides_with_registered && !owned_by_current {
+            die("agent-radio: that agent name is already in use");
+        }
+        let collides_with_legacy =
+            known_agents_from_messages(&load_messages(s))
+                .iter()
+                .any(|legacy| {
+                    legacy.eq_ignore_ascii_case(name) && !legacy.eq_ignore_ascii_case(&current.name)
+                });
+        if collides_with_legacy {
+            die("agent-radio: that agent name is already present in message history");
+        }
+    }
+
+    let record = registry
+        .get_mut("agents")
+        .and_then(Value::as_object_mut)
+        .and_then(|records| records.get_mut(&client_key))
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"));
+    match target.as_deref() {
+        Some(name) => {
+            let aliases = record
+                .entry("aliases")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"));
+            if !aliases
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+            {
+                aliases.push(json!(name));
+            }
+            record.insert("display_name".into(), json!(name));
+        }
+        None => {
+            record.insert("display_name".into(), json!(""));
+        }
+    }
+    write_json_atomic(&s.root, "agents.json", &registry);
+    let display = target
+        .as_deref()
+        .unwrap_or(current.name.as_str())
+        .to_string();
+    (current.name, display)
 }
 
 fn register_agent(s: &Store, client_id: &str, provider: Option<&str>) -> String {
@@ -363,6 +547,8 @@ fn register_agent(s: &Store, client_id: &str, provider: Option<&str>) -> String 
     let record = json!({
         "ordinal": ordinal - 1,
         "name": name,
+        "display_name": "",
+        "aliases": [],
         "provider": provider.unwrap_or(""),
         "created_at": utc_now(),
     });
@@ -750,7 +936,11 @@ fn short(text: &str, limit: usize) -> String {
 
 /// render() is the trust boundary: any process can append to the JSONL, so
 /// every displayed field goes through sanitize(), not just the body.
-fn render(messages: &[Map<String, Value>]) -> Vec<String> {
+fn render(s: &Store, messages: &[Map<String, Value>]) -> Vec<String> {
+    let display_names: BTreeMap<String, String> = load_registered_agents(s)
+        .into_iter()
+        .map(|agent| (agent.name.clone(), displayed_name(&agent).to_string()))
+        .collect();
     let mut lines = Vec::new();
     for (idx, msg) in messages.iter().enumerate() {
         let opt = |key: &str, prefix: &str| -> String {
@@ -765,8 +955,8 @@ fn render(messages: &[Map<String, Value>]) -> Vec<String> {
             "{:>2}. {} {} -> {} {}{}{}{} #{}",
             idx + 1,
             sanitize(str_field(msg, "ts")),
-            sanitize(str_field(msg, "from")),
-            sanitize(str_field(msg, "to")),
+            sanitize(display_from_map(&display_names, str_field(msg, "from"),)),
+            sanitize(display_from_map(&display_names, str_field(msg, "to"))),
             sanitize(str_field(msg, "kind")),
             opt("priority", ""),
             opt("branch", ""),
@@ -810,8 +1000,8 @@ fn render(messages: &[Map<String, Value>]) -> Vec<String> {
     lines
 }
 
-fn print_rendered(messages: &[Map<String, Value>]) {
-    println!("{}", render(messages).join("\n"));
+fn print_rendered(s: &Store, messages: &[Map<String, Value>]) {
+    println!("{}", render(s, messages).join("\n"));
 }
 
 // ------------------------------------------------------------- compose --
@@ -918,9 +1108,11 @@ fn cmd_send(args: &SendArgs) {
         None => current_branch(),
     };
     let body = body_arg(&args.body);
+    validate_name(&args.to);
+    let recipient = resolve_agent_name(&s, &args.to);
     let msg = make_message(
         &sender,
-        validate_name(&args.to),
+        &recipient,
         &args.kind,
         &body,
         branch.as_deref(),
@@ -959,8 +1151,8 @@ fn cmd_send(args: &SendArgs) {
     println!(
         "sent {} {} -> {} #{}",
         str_field(&msg, "kind"),
-        str_field(&msg, "from"),
-        str_field(&msg, "to"),
+        display_agent_name(&s, str_field(&msg, "from")),
+        display_agent_name(&s, str_field(&msg, "to")),
         str_field(&msg, "id"),
     );
 }
@@ -985,9 +1177,9 @@ fn cmd_inbox(as_agent: Option<&str>, peek: bool) {
         }
     }
     if messages.is_empty() {
-        println!("inbox for {agent}: empty");
+        println!("inbox for {}: empty", display_agent_name(&s, &agent));
     } else {
-        print_rendered(&messages);
+        print_rendered(&s, &messages);
     }
 }
 
@@ -1001,7 +1193,9 @@ fn cmd_history(
     let agent = as_agent.map(|a| agent_from_env(Some(a)));
     let mut messages = load_messages(&s);
     if let Some(w) = with_agent {
-        messages.retain(|m| str_field(m, "from") == w || str_field(m, "to") == w);
+        validate_name(w);
+        let canonical = resolve_agent_name(&s, w);
+        messages.retain(|m| str_field(m, "from") == canonical || str_field(m, "to") == canonical);
     }
     if let Some(b) = branch {
         messages.retain(|m| str_field(m, "branch") == b);
@@ -1019,7 +1213,7 @@ fn cmd_history(
     if messages.is_empty() {
         println!("history: empty");
     } else {
-        print_rendered(&messages);
+        print_rendered(&s, &messages);
     }
 }
 
@@ -1357,9 +1551,31 @@ fn cmd_reply_kind(
     }
     println!(
         "sent {kind} re #{original_id} -> {} #{}",
-        str_field(&msg, "to"),
+        display_agent_name(&s, str_field(&msg, "to")),
         str_field(&msg, "id"),
     );
+}
+
+fn required_client_id(explicit: Option<String>, command: &str) -> String {
+    explicit
+        .or_else(|| std::env::var("AGENT_RADIO_CLIENT_ID").ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            die(&format!(
+                "agent-radio: {command} requires --client-id or AGENT_RADIO_CLIENT_ID"
+            ))
+        })
+}
+
+fn cmd_rename(client_id: Option<String>, name: Option<String>) {
+    let s = store();
+    let client_id = required_client_id(client_id, "rename");
+    let (canonical, display) = rename_agent(&s, &client_id, name.as_deref());
+    if canonical == display {
+        println!("{canonical}");
+    } else {
+        println!("{display}\t{canonical}");
+    }
 }
 
 fn cmd_team() {
@@ -1386,18 +1602,20 @@ fn cmd_team() {
     }
     for agent in registered {
         println!(
-            "{}\t{}\t{}",
-            agent.name,
+            "{}\t{}\t{}\t{}",
+            displayed_name(&agent),
             agent.provider.as_deref().unwrap_or("-"),
             last_seen
                 .get(&agent.name)
+                .filter(|value| !value.is_empty())
                 .map(String::as_str)
-                .unwrap_or(&agent.created_at)
+                .unwrap_or(&agent.created_at),
+            agent.name,
         );
     }
     for (name, ts) in last_seen {
         if !registered_names.contains(name.as_str()) {
-            println!("{name}\t-\t{ts}");
+            println!("{name}\t-\t{ts}\t{name}");
         }
     }
 }
@@ -1421,9 +1639,15 @@ fn cmd_status(as_agent: Option<&str>, quiet: bool) {
     if quiet {
         exit(if unread_count > 0 { 0 } else { 1 });
     }
+    let display_name = display_agent_name(&s, &agent);
     println!(
         "{}",
-        json!({ "agent": agent, "flag": flagged, "unread": unread_count })
+        json!({
+            "agent": agent,
+            "display_name": display_name,
+            "flag": flagged,
+            "unread": unread_count,
+        })
     );
 }
 
@@ -1441,7 +1665,7 @@ fn cmd_wait(as_agent: Option<&str>, timeout: f64, interval: f64) {
                     .map(|m| str_field(m, "id").to_string())
                     .collect();
                 save_view(&s, &agent, &ids);
-                print_rendered(&unread);
+                print_rendered(&s, &unread);
                 return;
             }
             clear_notify_if_caught_up(&s, &agent, &unread);
@@ -1577,10 +1801,25 @@ struct RegisterArgs {
     provider: Option<String>,
 }
 
+#[derive(clap::Args)]
+struct RenameArgs {
+    /// stable id for this agent session (default: AGENT_RADIO_CLIENT_ID)
+    #[arg(long)]
+    client_id: Option<String>,
+    /// custom display/routing alias
+    #[arg(long, required_unless_present = "reset", conflicts_with = "reset")]
+    name: Option<String>,
+    /// restore the automatically assigned name
+    #[arg(long, conflicts_with = "name")]
+    reset: bool,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// assign or recover a human name for an agent session
     Register(RegisterArgs),
+    /// set a custom alias without changing the stable routing identity
+    Rename(RenameArgs),
     /// send a typed message
     Send(SendArgs),
     /// show unread messages for an agent
@@ -1639,21 +1878,17 @@ enum Cmd {
 fn main() {
     match Cli::parse().cmd {
         Cmd::Register(a) => {
-            let client_id = a
-                .client_id
-                .or_else(|| std::env::var("AGENT_RADIO_CLIENT_ID").ok())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| {
-                    die("agent-radio: register requires --client-id or AGENT_RADIO_CLIENT_ID")
-                });
+            let client_id = required_client_id(a.client_id, "register");
             let provider = a
                 .provider
                 .or_else(|| std::env::var("AGENT_RADIO_PROVIDER").ok())
                 .filter(|value| !value.is_empty());
-            println!(
-                "{}",
-                register_agent(&store(), &client_id, provider.as_deref())
-            );
+            let s = store();
+            let canonical = register_agent(&s, &client_id, provider.as_deref());
+            println!("{}", display_agent_name(&s, &canonical));
+        }
+        Cmd::Rename(a) => {
+            cmd_rename(a.client_id, if a.reset { None } else { a.name });
         }
         Cmd::Send(args) => cmd_send(&args),
         Cmd::Inbox { as_agent, peek } => cmd_inbox(as_agent.as_deref(), peek),

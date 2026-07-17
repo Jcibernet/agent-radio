@@ -35,7 +35,8 @@ const factory: CustomToolFactory = (pi) => {
 			"Local agent radio (agent-radio binary) for coordinating named agents",
 			"working this worktree. AGENT_RADIO_CLIENT_ID assigns Alice, Bob, Charlie, ...",
 			"in creation order; AGENT_RADIO_PROVIDER retains implementation metadata. Ops:",
-			"register (assign/recover my human name), send (requires to+body; kind defaults ASK),",
+			"register (assign/recover my human name), rename (set/reset my safe alias),",
+			"send (requires to+body; kind defaults ASK),",
 			"inbox (unread for me; peek=true to not mark read),",
 			"history (recent traffic; limit/with filters),",
 			"ack/done/decline/failure (reply to a numbered message from the last inbox/history view),",
@@ -46,6 +47,7 @@ const factory: CustomToolFactory = (pi) => {
 		parameters: z.object({
 			op: z.enum([
 				"register",
+				"rename",
 				"send",
 				"inbox",
 				"history",
@@ -61,6 +63,11 @@ const factory: CustomToolFactory = (pi) => {
 				.string()
 				.optional()
 				.describe("explicit agent identity; otherwise resolved from the environment"),
+			name: z.string().optional().describe("rename: custom agent alias"),
+			reset: z
+				.boolean()
+				.optional()
+				.describe("rename: restore the automatically assigned name"),
 			to: z.string().optional().describe("send: recipient agent or 'all'"),
 			kind: z
 				.enum(KINDS)
@@ -138,6 +145,15 @@ const factory: CustomToolFactory = (pi) => {
 			switch (params.op) {
 				case "register": {
 					argv.push("register");
+					break;
+				}
+				case "rename": {
+					if (Boolean(params.reset) === Boolean(params.name)) {
+						throw new Error("rename requires exactly one of 'name' or 'reset=true'");
+					}
+					argv.push("rename");
+					if (params.name) argv.push("--name", params.name);
+					else argv.push("--reset");
 					break;
 				}
 				case "send": {
