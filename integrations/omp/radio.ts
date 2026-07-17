@@ -32,9 +32,10 @@ const factory: CustomToolFactory = (pi) => {
 		name: "radio",
 		label: "Agent Radio",
 		description: [
-			"Local agent radio (agent-radio binary) for coordinating with the other agents",
-			"working this worktree (opencode, droid, ...). Ops:",
-			"send (requires to+body; kind defaults ASK),",
+			"Local agent radio (agent-radio binary) for coordinating named agents",
+			"working this worktree. AGENT_RADIO_CLIENT_ID assigns Alice, Bob, Charlie, ...",
+			"in creation order; AGENT_RADIO_PROVIDER retains implementation metadata. Ops:",
+			"register (assign/recover my human name), send (requires to+body; kind defaults ASK),",
 			"inbox (unread for me; peek=true to not mark read),",
 			"history (recent traffic; limit/with filters),",
 			"ack/done/decline/failure (reply to a numbered message from the last inbox/history view),",
@@ -44,6 +45,7 @@ const factory: CustomToolFactory = (pi) => {
 		].join(" "),
 		parameters: z.object({
 			op: z.enum([
+				"register",
 				"send",
 				"inbox",
 				"history",
@@ -58,7 +60,7 @@ const factory: CustomToolFactory = (pi) => {
 			as: z
 				.string()
 				.optional()
-				.describe("agent identity; defaults to 'claude'"),
+				.describe("explicit agent identity; otherwise resolved from the environment"),
 			to: z.string().optional().describe("send: recipient agent or 'all'"),
 			kind: z
 				.enum(KINDS)
@@ -127,15 +129,24 @@ const factory: CustomToolFactory = (pi) => {
 		}),
 
 		async execute(_toolCallId, params, _onUpdate, _ctx, signal) {
-			const me = params.as ?? process.env.AGENT_RADIO_AGENT ?? "claude";
+			const me = params.as ?? process.env.AGENT_RADIO_AGENT;
 			const argv: string[] = [];
+			const addIdentity = (flag: "--from" | "--as") => {
+				if (me) argv.push(flag, me);
+			};
 
 			switch (params.op) {
+				case "register": {
+					argv.push("register");
+					break;
+				}
 				case "send": {
 					if (!params.to || !params.body) {
 						throw new Error("send requires 'to' and 'body'");
 					}
-					argv.push("send", "--from", me, "--to", params.to);
+					argv.push("send");
+					addIdentity("--from");
+					argv.push("--to", params.to);
 					argv.push("--kind", params.kind ?? "ASK");
 					argv.push("--body", params.body);
 					for (const f of params.focus ?? []) argv.push("--focus", f);
@@ -148,12 +159,14 @@ const factory: CustomToolFactory = (pi) => {
 					break;
 				}
 				case "inbox": {
-					argv.push("inbox", "--as", me);
+					argv.push("inbox");
+					addIdentity("--as");
 					if (params.peek) argv.push("--peek");
 					break;
 				}
 				case "history": {
-					argv.push("history", "--as", me);
+					argv.push("history");
+					addIdentity("--as");
 					if (params.limit != null) argv.push("--limit", String(params.limit));
 					if (params.with) argv.push("--with", params.with);
 					break;
@@ -167,7 +180,8 @@ const factory: CustomToolFactory = (pi) => {
 							`${params.op} requires 'number' (from the last inbox/history view)`,
 						);
 					}
-					argv.push(params.op, String(params.number), "--as", me);
+					argv.push(params.op, String(params.number));
+					addIdentity("--as");
 					if (params.body) argv.push("--body", params.body);
 					if (params.no_manifest) argv.push("--no-manifest");
 					if (params.manifest_auto) argv.push("--manifest-auto");
@@ -192,7 +206,7 @@ const factory: CustomToolFactory = (pi) => {
 					if (params.strict) argv.push("--strict");
 					for (const pattern of params.ignore ?? [])
 						argv.push("--ignore", pattern);
-					argv.push("--as", me);
+					addIdentity("--as");
 					break;
 				}
 				case "manifest_map": {
@@ -208,11 +222,13 @@ const factory: CustomToolFactory = (pi) => {
 					break;
 				}
 				case "status": {
-					argv.push("status", "--as", me);
+					argv.push("status");
+					addIdentity("--as");
 					break;
 				}
 				case "wait": {
-					argv.push("wait", "--as", me);
+					argv.push("wait");
+					addIdentity("--as");
 					if (params.timeout != null) {
 						argv.push("--timeout", String(params.timeout));
 					}

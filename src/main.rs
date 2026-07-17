@@ -12,6 +12,8 @@
 //!
 //! The store format (JSONL messages + `seen`/`views`/`notify` sidecars) is the
 //! compatibility contract: any implementation that preserves it interoperates.
+//!   AGENT_RADIO_CLIENT_ID stable session id used to assign a human name
+//!   AGENT_RADIO_PROVIDER  optional provider metadata (claude, opencode, ...)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -45,6 +47,11 @@ const KINDS: [&str; 10] = [
     "RISK",
 ];
 
+const HUMAN_NAMES: [&str; 26] = [
+    "Alice", "Bob", "Charlie", "Diana", "Ethan", "Fiona", "George", "Hannah", "Isaac", "Julia",
+    "Kevin", "Laura", "Michael", "Nora", "Oliver", "Penny", "Quentin", "Rachel", "Samuel", "Tina",
+    "Ursula", "Victor", "Wendy", "Xavier", "Yvonne", "Zachary",
+];
 static NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]+$").unwrap());
 
 static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -72,6 +79,7 @@ fn die(msg: &str) -> ! {
 struct Store {
     root: PathBuf,
     messages: PathBuf,
+    agents: PathBuf,
     lock: PathBuf,
     seen_dir: PathBuf,
     views_dir: PathBuf,
@@ -124,6 +132,7 @@ fn store() -> Store {
     let root = store_root();
     Store {
         messages: root.join("messages.jsonl"),
+        agents: root.join("agents.json"),
         lock: root.join("lock"),
         seen_dir: root.join("seen"),
         views_dir: root.join("views"),
@@ -179,18 +188,26 @@ fn require_no_secret(text: &str) {
 }
 
 fn agent_from_env(explicit: Option<&str>) -> String {
-    let name = explicit.map(str::to_string).or_else(|| {
+    if let Some(name) = explicit.map(str::to_string).or_else(|| {
         std::env::var("AGENT_RADIO_AGENT")
             .ok()
             .filter(|v| !v.is_empty())
-    });
-    match name {
-        Some(n) => {
-            validate_name(&n);
-            n
-        }
-        None => die("agent-radio: pass --as/--from or set AGENT_RADIO_AGENT"),
+    }) {
+        validate_name(&name);
+        return name;
     }
+    if let Ok(client_id) = std::env::var("AGENT_RADIO_CLIENT_ID") {
+        if !client_id.is_empty() {
+            let provider = std::env::var("AGENT_RADIO_PROVIDER")
+                .ok()
+                .filter(|v| !v.is_empty());
+            return register_agent(&store(), &client_id, provider.as_deref());
+        }
+    }
+    die(
+        "agent-radio: pass --as/--from, set AGENT_RADIO_AGENT, or set \
+         AGENT_RADIO_CLIENT_ID for automatic human naming",
+    )
 }
 
 // ------------------------------------------------------------- messages --
@@ -223,6 +240,140 @@ fn sha256_bytes(data: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+#[derive(Clone)]
+struct RegisteredAgent {
+    ordinal: u64,
+    name: String,
+    provider: Option<String>,
+    created_at: String,
+}
+
+fn empty_registry() -> Value {
+    json!({ "next_ordinal": 0, "agents": {} })
+}
+
+fn load_registry(s: &Store) -> Value {
+    let text = match fs::read_to_string(&s.agents) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return empty_registry(),
+        Err(e) => die(&format!("agent-radio: {e}")),
+    };
+    let value: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|_| die("agent-radio: agents registry is corrupt"));
+    if value.get("next_ordinal").and_then(Value::as_u64).is_none()
+        || value.get("agents").and_then(Value::as_object).is_none()
+    {
+        die("agent-radio: agents registry is corrupt");
+    }
+    value
+}
+
+fn load_registered_agents(s: &Store) -> Vec<RegisteredAgent> {
+    let registry = load_registry(s);
+    let records = registry
+        .get("agents")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"));
+    let mut agents: Vec<RegisteredAgent> = records
+        .values()
+        .map(|record| {
+            let ordinal = record
+                .get("ordinal")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"));
+            let name = record
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"))
+                .to_string();
+            validate_name(&name);
+            let provider = record
+                .get("provider")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(value) = &provider {
+                validate_name(value);
+            }
+            let created_at = record
+                .get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"))
+                .to_string();
+            RegisteredAgent {
+                ordinal,
+                name,
+                provider,
+                created_at,
+            }
+        })
+        .collect();
+    agents.sort_by_key(|agent| agent.ordinal);
+    agents
+}
+
+fn human_name(ordinal: u64) -> String {
+    let index = ordinal as usize % HUMAN_NAMES.len();
+    let generation = ordinal as usize / HUMAN_NAMES.len();
+    if generation == 0 {
+        HUMAN_NAMES[index].to_string()
+    } else {
+        format!("{}-{}", HUMAN_NAMES[index], generation + 1)
+    }
+}
+
+fn register_agent(s: &Store, client_id: &str, provider: Option<&str>) -> String {
+    if client_id.is_empty() {
+        die("agent-radio: client id must not be empty");
+    }
+    if let Some(value) = provider {
+        validate_name(value);
+    }
+    let client_key = sha256_bytes(client_id.as_bytes());
+    let _guard = locked(s);
+    let mut registry = load_registry(s);
+    if let Some(name) = registry
+        .get("agents")
+        .and_then(Value::as_object)
+        .and_then(|agents| agents.get(&client_key))
+        .and_then(|record| record.get("name"))
+        .and_then(Value::as_str)
+    {
+        return name.to_string();
+    }
+
+    let mut used: BTreeSet<String> = load_registered_agents(s)
+        .into_iter()
+        .map(|agent| agent.name)
+        .collect();
+    used.extend(known_agents_from_messages(&load_messages(s)));
+    let mut ordinal = registry
+        .get("next_ordinal")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"));
+    let name = loop {
+        let candidate = human_name(ordinal);
+        ordinal += 1;
+        if !used.contains(&candidate) {
+            break candidate;
+        }
+    };
+    let record = json!({
+        "ordinal": ordinal - 1,
+        "name": name,
+        "provider": provider.unwrap_or(""),
+        "created_at": utc_now(),
+    });
+    registry["next_ordinal"] = json!(ordinal);
+    registry
+        .get_mut("agents")
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| die("agent-radio: agents registry is corrupt"))
+        .insert(client_key, record);
+    write_json_atomic(&s.root, "agents.json", &registry);
+    name
 }
 
 fn sha256_file(path: &Path) -> Option<String> {
@@ -438,7 +589,7 @@ fn notify_path(s: &Store, agent: &str) -> PathBuf {
     s.notify_dir.join(format!("{agent}.flag"))
 }
 
-fn known_agents(messages: &[Map<String, Value>]) -> BTreeSet<String> {
+fn known_agents_from_messages(messages: &[Map<String, Value>]) -> BTreeSet<String> {
     let mut agents = BTreeSet::new();
     for msg in messages {
         let sender = str_field(msg, "from");
@@ -453,11 +604,21 @@ fn known_agents(messages: &[Map<String, Value>]) -> BTreeSet<String> {
     agents
 }
 
+fn known_agents(s: &Store, messages: &[Map<String, Value>]) -> BTreeSet<String> {
+    let mut agents = known_agents_from_messages(messages);
+    agents.extend(
+        load_registered_agents(s)
+            .into_iter()
+            .map(|agent| agent.name),
+    );
+    agents
+}
+
 fn set_notify_flags(s: &Store, msg: &Map<String, Value>, messages: &[Map<String, Value>]) {
     fs::create_dir_all(&s.notify_dir).unwrap_or_else(|e| die(&format!("agent-radio: {e}")));
     let to = str_field(msg, "to");
     let recipients: BTreeSet<String> = if to == "all" {
-        let mut r = known_agents(messages);
+        let mut r = known_agents(s, messages);
         r.remove(str_field(msg, "from"));
         r
     } else if !to.is_empty() {
@@ -1202,23 +1363,42 @@ fn cmd_reply_kind(
 }
 
 fn cmd_team() {
-    let mut agents: BTreeMap<String, String> = BTreeMap::new();
-    for msg in load_messages(&store()) {
-        let sender = str_field(&msg, "from");
+    let s = store();
+    let messages = load_messages(&s);
+    let mut last_seen: BTreeMap<String, String> = BTreeMap::new();
+    for msg in &messages {
+        let sender = str_field(msg, "from");
         if !sender.is_empty() {
-            agents.insert(sender.to_string(), str_field(&msg, "ts").to_string());
+            last_seen.insert(sender.to_string(), str_field(msg, "ts").to_string());
         }
-        let to = str_field(&msg, "to");
+        let to = str_field(msg, "to");
         if !to.is_empty() && to != "all" {
-            agents.entry(to.to_string()).or_default();
+            last_seen.entry(to.to_string()).or_default();
         }
     }
-    if agents.is_empty() {
+
+    let registered = load_registered_agents(&s);
+    let registered_names: BTreeSet<String> =
+        registered.iter().map(|agent| agent.name.clone()).collect();
+    if registered.is_empty() && last_seen.is_empty() {
         println!("team: empty");
         return;
     }
-    for (name, ts) in agents {
-        println!("{name}\t{ts}");
+    for agent in registered {
+        println!(
+            "{}\t{}\t{}",
+            agent.name,
+            agent.provider.as_deref().unwrap_or("-"),
+            last_seen
+                .get(&agent.name)
+                .map(String::as_str)
+                .unwrap_or(&agent.created_at)
+        );
+    }
+    for (name, ts) in last_seen {
+        if !registered_names.contains(name.as_str()) {
+            println!("{name}\t-\t{ts}");
+        }
     }
 }
 
@@ -1387,8 +1567,20 @@ enum ManifestCmd {
     Map(ManifestMapArgs),
 }
 
+#[derive(clap::Args)]
+struct RegisterArgs {
+    /// stable id for this agent session (default: AGENT_RADIO_CLIENT_ID)
+    #[arg(long)]
+    client_id: Option<String>,
+    /// implementation metadata, not the routing identity
+    #[arg(long)]
+    provider: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
+    /// assign or recover a human name for an agent session
+    Register(RegisterArgs),
     /// send a typed message
     Send(SendArgs),
     /// show unread messages for an agent
@@ -1446,6 +1638,23 @@ enum Cmd {
 
 fn main() {
     match Cli::parse().cmd {
+        Cmd::Register(a) => {
+            let client_id = a
+                .client_id
+                .or_else(|| std::env::var("AGENT_RADIO_CLIENT_ID").ok())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    die("agent-radio: register requires --client-id or AGENT_RADIO_CLIENT_ID")
+                });
+            let provider = a
+                .provider
+                .or_else(|| std::env::var("AGENT_RADIO_PROVIDER").ok())
+                .filter(|value| !value.is_empty());
+            println!(
+                "{}",
+                register_agent(&store(), &client_id, provider.as_deref())
+            );
+        }
         Cmd::Send(args) => cmd_send(&args),
         Cmd::Inbox { as_agent, peek } => cmd_inbox(as_agent.as_deref(), peek),
         Cmd::History {

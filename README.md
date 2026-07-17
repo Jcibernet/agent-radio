@@ -63,10 +63,14 @@ cargo install --git https://github.com/Jcibernet/agent-radio
 ## Usage
 
 ```bash
-export AGENT_RADIO_AGENT=claude          # identity for --as/--from defaults
+# A harness sets one stable id per agent session. Registration is atomic:
+# the first session becomes Alice, the second Bob, then Charlie, Diana, ...
+export AGENT_RADIO_CLIENT_ID=claude-session-42
+export AGENT_RADIO_PROVIDER=claude          # metadata, not the routing identity
+agent-radio register                       # Alice
 
-# Ask another agent something, pointing at concrete files
-agent-radio send --to opencode --kind ASK \
+# Ask another registered agent something, pointing at concrete files
+agent-radio send --to Bob --kind ASK \
   --body "Are you still touching parse_pipeline.py? I need to extend the extractor." \
   --focus backend/app/services/parse_pipeline.py
 
@@ -79,13 +83,13 @@ agent-radio done 1 --body "Merged, files are yours."
 
 # Long or quote-heavy bodies: pass '-' to read stdin (also keeps the
 # message out of `ps` output and shell history)
-git diff --stat | agent-radio send --to droid --kind FYI --body -
+git diff --stat | agent-radio send --to Charlie --kind FYI --body -
 
 # Broadcast to everyone
 agent-radio send --to all --kind FYI --body "Releasing to prod in 10 minutes."
 
 # Recent traffic, filtered
-agent-radio history --limit 30 --with droid
+agent-radio history --limit 30 --with Bob
 
 # Who's on the air / do I have mail / block until something arrives
 agent-radio team
@@ -93,6 +97,18 @@ agent-radio status            # {"agent": ..., "unread": N, "flag": bool}
 agent-radio status --quiet    # exit 0 iff unread > 0 (for shell loops)
 agent-radio wait --timeout 300
 ```
+
+### Human agent names
+
+`AGENT_RADIO_CLIENT_ID` is hashed into the local `agents.json` registry; the
+raw session id is never stored or rendered. Reusing the same id recovers the
+same name. New ids receive names in creation order under the store lock:
+Alice, Bob, Charlie, Diana, and so on. After the 26-name pool, names continue
+as `Alice-2`, `Bob-2`, etc.; names are never recycled.
+
+Harnesses should create a stable, unique client id when they spawn an agent and
+keep it for that logical session. `AGENT_RADIO_AGENT` and explicit `--as` /
+`--from` remain available when a caller needs a manually chosen identity.
 
 ### Task manifests (verified completion)
 
@@ -184,7 +200,9 @@ so pre-manifest stores and other implementations keep interoperating.
 
 | Variable | Effect |
 |---|---|
-| `AGENT_RADIO_AGENT` | Default identity for `--as` / `--from` |
+| `AGENT_RADIO_CLIENT_ID` | Stable agent-session id. When no explicit identity is supplied, atomically assigns or recovers a human name such as `Alice` or `Bob`. Stored only as a SHA256 digest. |
+| `AGENT_RADIO_PROVIDER` | Optional implementation metadata shown by `team`, for example `claude` or `opencode`; it is not the routing identity. |
+| `AGENT_RADIO_AGENT` | Explicit identity override for `--as` / `--from`. Takes precedence over automatic naming. |
 | `AGENT_RADIO_DIR` | Store directory. Default: `<git-root>/.git/.agent-radio`. Setting it lets you run outside a git worktree, or share a bus across repos. |
 | `AGENT_RADIO_REQUIRE_MANIFEST` | Set to `1` to reject `DONE` messages that carry neither `--manifest`, `--manifest-auto`, nor `--no-manifest`. |
 
@@ -193,7 +211,8 @@ so pre-manifest stores and other implementations keep interoperating.
 - **[omp](https://omp.sh) custom tool** — `integrations/omp/radio.ts` exposes
   the radio as a schema'd native tool (no shell quoting for message bodies).
   Drop it in `.omp/tools/` in your repo; set `AGENT_RADIO_BIN` if the binary
-  is not on PATH.
+  is not on PATH. Set a unique `AGENT_RADIO_CLIENT_ID` and optional
+  `AGENT_RADIO_PROVIDER` in each spawned agent's environment.
 - **Any other harness** — it is a CLI; call it from bash. The `--quiet` status
   and `wait` subcommands are designed for scripting.
 

@@ -7,6 +7,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -26,6 +28,8 @@ impl Radio {
         let mut c = Command::new(env!("CARGO_BIN_EXE_agent-radio"));
         c.env("AGENT_RADIO_DIR", self.dir.path());
         c.env_remove("AGENT_RADIO_AGENT");
+        c.env_remove("AGENT_RADIO_CLIENT_ID");
+        c.env_remove("AGENT_RADIO_PROVIDER");
         c
     }
 
@@ -171,6 +175,160 @@ fn identity_from_env_var() {
 fn missing_identity_fails() {
     let r = Radio::new();
     r.fails(&["send", "--to", "b", "--body", "hi", "--branch", ""]);
+}
+
+#[test]
+fn registration_assigns_stable_human_names_in_creation_order() {
+    let r = Radio::new();
+    assert_eq!(
+        r.ok(&[
+            "register",
+            "--client-id",
+            "session-alice",
+            "--provider",
+            "claude"
+        ])
+        .trim(),
+        "Alice"
+    );
+    assert_eq!(
+        r.ok(&["register", "--client-id", "session-alice"]).trim(),
+        "Alice"
+    );
+    assert_eq!(
+        r.ok(&[
+            "register",
+            "--client-id",
+            "session-bob",
+            "--provider",
+            "opencode"
+        ])
+        .trim(),
+        "Bob"
+    );
+
+    let team = r.ok(&["team"]);
+    let lines: Vec<&str> = team.lines().collect();
+    assert!(lines[0].starts_with("Alice\tclaude\t"));
+    assert!(lines[1].starts_with("Bob\topencode\t"));
+    let registry = fs::read_to_string(r.dir.path().join("agents.json")).unwrap();
+    assert!(!registry.contains("session-alice"));
+    assert!(!registry.contains("session-bob"));
+}
+
+#[test]
+fn client_id_identity_routes_messages_end_to_end() {
+    let r = Radio::new();
+    r.ok(&["register", "--client-id", "session-alice"]);
+    r.ok(&["register", "--client-id", "session-bob"]);
+
+    let mut alice = r.cmd();
+    alice.env("AGENT_RADIO_CLIENT_ID", "session-alice");
+    let sent = alice
+        .args([
+            "send",
+            "--to",
+            "Bob",
+            "--body",
+            "Can you review this?",
+            "--branch",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(sent.status.success());
+    assert!(String::from_utf8(sent.stdout)
+        .unwrap()
+        .contains("Alice -> Bob"));
+
+    let mut bob = r.cmd();
+    bob.env("AGENT_RADIO_CLIENT_ID", "session-bob");
+    let inbox = bob.args(["inbox"]).output().unwrap();
+    assert!(inbox.status.success());
+    let rendered = String::from_utf8(inbox.stdout).unwrap();
+    assert!(rendered.contains("Alice -> Bob"));
+    assert!(rendered.contains("Can you review this?"));
+}
+
+#[test]
+fn concurrent_registration_never_reuses_a_human_name() {
+    let r = Radio::new();
+    let store = r.dir.path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|index| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let output = Command::new(env!("CARGO_BIN_EXE_agent-radio"))
+                    .env("AGENT_RADIO_DIR", store)
+                    .args(["register", "--client-id", &format!("session-{index}")])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                String::from_utf8(output.stdout).unwrap().trim().to_string()
+            })
+        })
+        .collect();
+    let mut names: Vec<String> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["Alice", "Bob", "Charlie", "Diana", "Ethan", "Fiona", "George", "Hannah"]
+    );
+}
+
+#[test]
+fn human_name_pool_continues_without_reusing_names() {
+    let r = Radio::new();
+    let names: Vec<String> = (0..27)
+        .map(|index| {
+            r.ok(&["register", "--client-id", &format!("pool-session-{index}")])
+                .trim()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(names[0], "Alice");
+    assert_eq!(names[25], "Zachary");
+    assert_eq!(names[26], "Alice-2");
+}
+
+#[test]
+fn broadcast_notifies_registered_agents_before_their_first_message() {
+    let r = Radio::new();
+    r.ok(&["register", "--client-id", "session-alice"]);
+    r.ok(&["register", "--client-id", "session-bob"]);
+
+    let mut alice = r.cmd();
+    alice.env("AGENT_RADIO_CLIENT_ID", "session-alice");
+    let sent = alice
+        .args([
+            "send",
+            "--to",
+            "all",
+            "--kind",
+            "FYI",
+            "--body",
+            "Standup now",
+            "--branch",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(sent.status.success());
+
+    let mut bob = r.cmd();
+    bob.env("AGENT_RADIO_CLIENT_ID", "session-bob");
+    let status = bob.args(["status"]).output().unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["agent"], "Bob");
+    assert_eq!(status["unread"], 1);
+    assert_eq!(status["flag"], true);
 }
 
 // ----------------------------------------------------------------- flow --
