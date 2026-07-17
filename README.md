@@ -16,9 +16,9 @@ A tiny, file-backed message bus for coordinating multiple local coding agents
 worktree. No server, no MCP, no hooks — a single static binary.
 
 ```
-opencode ──┐
-           ├──> .git/.agent-radio/messages.jsonl <── claude
-droid ─────┘         (append-only, flock'd)
+Alice ───┐
+         ├──> .git/.agent-radio/messages.jsonl <── Bob
+Charlie ─┘         (append-only, flock'd)
 ```
 
 ## Why
